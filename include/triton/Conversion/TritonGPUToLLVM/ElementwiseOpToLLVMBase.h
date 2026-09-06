@@ -83,6 +83,7 @@ public:
     // We zero out the bases that are constant
     auto kReg = StringAttr::get(ctx, "register");
     auto ll = toLinearLayout(rtType);
+    ll = ll.removeZeroBasesAlongDim(kReg);
     auto dims = to_vector(ll.getOutDimNames());
     auto llReg = ll.sublayout({kReg}, dims);
     auto inv = ll.pseudoinvert();
@@ -94,8 +95,8 @@ public:
         bases_inv[d][i] = {0};
       }
     }
-    auto invBroadcast =
-        LinearLayout(bases_inv, invReg.getOutDims(), /*isSurjective=*/false);
+    auto invBroadcast = LinearLayout(std::move(bases_inv), invReg.getOutDims(),
+                                     /*isSurjective=*/false);
     auto cvt = llReg.compose(invBroadcast);
 
     // Deduplicate the result values
@@ -116,8 +117,7 @@ public:
     Type elemTy = this->getTypeConverter()->convertType(resultElementTy);
     SmallVector<SmallVector<Value>> allOperands;
     for (auto operand : adaptor.getOperands()) {
-      auto argTy = op->getOperand(0).getType();
-      auto subOperands = unpackLLElements(loc, operand, rewriter);
+      auto subOperands = unpackUniqueTensorElements(loc, operand, rewriter);
       allOperands.resize(subOperands.size());
       for (auto v : llvm::enumerate(subOperands))
         allOperands[v.index()].push_back(v.value());
@@ -139,8 +139,8 @@ public:
       it += curr.size();
     }
     resultVals = maybeDeduplicate(op, resultVals);
-    Value view = packLLElements(loc, this->getTypeConverter(), resultVals,
-                                rewriter, resultTy);
+    Value view = packUniqueTensorElements(loc, this->getTypeConverter(),
+                                          resultVals, rewriter, resultTy);
     rewriter.replaceOp(op, view);
 
     return success();

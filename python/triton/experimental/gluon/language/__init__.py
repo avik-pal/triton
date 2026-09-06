@@ -1,8 +1,11 @@
 from ._core import (
+    aggregate_replace,
     base_value,
     base_type,
     block_type,
     broadcast,
+    cast,
+    clamp,
     constexpr,
     dtype,
     void,
@@ -31,6 +34,7 @@ from ._core import (
     tuple_type,
     _unwrap_if_constexpr,
     # API Functions
+    add,
     allocate_shared_memory,
     arange,
     associative_scan,
@@ -41,6 +45,7 @@ from ._core import (
     atomic_max,
     atomic_min,
     atomic_or,
+    atomic_poll,
     atomic_xchg,
     atomic_xor,
     bank_conflicts,
@@ -50,6 +55,7 @@ from ._core import (
     dot_fma,
     expand_dims,
     full,
+    fp4_to_fp,
     gather,
     num_warps,
     num_ctas,
@@ -62,6 +68,7 @@ from ._core import (
     max_contiguous,
     maximum,
     minimum,
+    mul,
     multiple_of,
     num_programs,
     permute,
@@ -76,9 +83,11 @@ from ._core import (
     static_print,
     static_range,
     store,
-    thread_barrier,
+    sub,
+    barrier,
     to_linear_layout,
     to_tensor,
+    expect_zero,
     warp_specialize,
     where,
 )
@@ -93,6 +102,7 @@ from ._layouts import (
     SwizzledSharedLayout,
     PaddedSharedLayout,
     SharedLinearLayout,
+    CoalescedLayout,
 )
 from ._math import (
     umulhi,
@@ -118,6 +128,7 @@ from ._standard import (
     full_like,
     max,
     min,
+    ravel,
     reduce_or,
     sum,
     xor_sum,
@@ -128,3 +139,4 @@ from ._standard import (
 from . import nvidia
 from . import amd
 from . import extra
+from . import fpsan

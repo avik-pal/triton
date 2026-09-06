@@ -1,5 +1,5 @@
 """isort:skip_file"""
-__version__ = '3.5.0'
+__version__ = '3.8.0'
 
 # ---------------------------------------
 # Note: import order is significant here.
@@ -28,9 +28,11 @@ from . import testing
 from . import tools
 
 must_use_result = language.core.must_use_result
+aggregate = language.core._aggregate
 
 __all__ = [
     "AsyncCompileMode",
+    "aggregate",
     "autotune",
     "cdiv",
     "CompilationError",

@@ -1,6 +1,8 @@
 #include "Analysis/ScopeIdAllocation.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 
+#include <deque>
+
 namespace mlir {
 namespace triton::proton {
 
@@ -117,7 +119,16 @@ void ScopeIdAllocation::liveness() {
   llvm::DenseMap<ScopeId, RecordOp> idToOpMap;
   ScopeId scopeId = 0;
 
-  funcOp->walk<WalkOrder::PreOrder>([&](RecordOp recordOp) {
+  funcOp->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (auto eventAlloc = dyn_cast<AllocateEventOp>(op)) {
+      idToNameMap[scopeId] = eventAlloc.getName();
+      opToIdMap[op] = scopeId;
+      ++scopeId;
+      return;
+    }
+    auto recordOp = dyn_cast<RecordOp>(op);
+    if (!recordOp)
+      return;
     auto name = recordOp.getName();
     LDBG("Processing RecordOp: " << recordOp);
     if (!nameToIdMap.contains(name)) {
@@ -162,17 +173,10 @@ void ScopeIdAllocation::reachability() {
   DenseMap<VirtualBlock, BlockInfo> outputBlockInfoMap;
 
   std::deque<VirtualBlock> virtualBlockList;
-  funcOp->walk<WalkOrder::PreOrder>([&](Block *block) {
-    // Seed the worklist with entry blocks of regions that are
-    // isolated-from-above.
-    if (block->isEntryBlock() &&
-        !isa<RegionBranchOpInterface>(block->getParentOp()))
-      virtualBlockList.emplace_back(block, Block::iterator());
-  });
+  virtualBlockList.emplace_back(&funcOp.getBlocks().front(), Block::iterator());
 
-  DenseSet<VirtualBlock> exitVirtualBlocks;
   while (!virtualBlockList.empty()) {
-    VirtualBlock &virtualBlock = virtualBlockList.front();
+    VirtualBlock virtualBlock = virtualBlockList.front();
     virtualBlockList.pop_front();
     // Evaluate the transfer function for this block starting from the cached
     // input state.
@@ -195,9 +199,6 @@ void ScopeIdAllocation::reachability() {
           inputBlockInfo.erase(scopeId);
         }
       }
-    }
-    if (successors.empty()) {
-      exitVirtualBlocks.insert(virtualBlock);
     }
     // Skip successor propagation if the output state is unchanged.
     if (outputBlockInfoMap.count(virtualBlock) &&
@@ -246,6 +247,7 @@ void ScopeIdAllocation::reachability() {
 void ScopeIdAllocation::dominance() {
   // Stage 3: derive scope parentage and verify dominance constraints.
   mlir::DominanceInfo domInfo(funcOp);
+  mlir::PostDominanceInfo postDomInfo(funcOp);
   llvm::DenseMap<ScopeId, Operation *> startRecordMap;
   llvm::DenseMap<ScopeId, Operation *> endRecordMap;
   funcOp->walk<WalkOrder::PreOrder>([&](RecordOp recordOp) {
@@ -281,7 +283,7 @@ void ScopeIdAllocation::dominance() {
       auto parentScopeId = opToIdMap.lookup(parentStartOp);
       auto parentEndOp = endRecordMap.lookup(parentScopeId);
       if (domInfo.dominates(parentStartOp, startOp) &&
-          domInfo.dominates(endOp, parentEndOp)) {
+          postDomInfo.postDominates(parentEndOp, endOp)) {
         auto parentId = opToIdMap.lookup(parentStartOp);
         auto childId = opToIdMap.lookup(startOp);
         scopeParentIds.push_back({childId, parentId});
@@ -289,6 +291,21 @@ void ScopeIdAllocation::dominance() {
       }
     }
   }
+
+  // An asynchronous event inherits the innermost synchronous scope active at
+  // its allocation site. Its start and end endpoints may execute elsewhere.
+  funcOp->walk<WalkOrder::PreOrder>([&](AllocateEventOp eventOp) {
+    for (int j = sortedStartRecordOps.size() - 1; j >= 0; --j) {
+      auto *parentStartOp = sortedStartRecordOps[j];
+      auto parentScopeId = opToIdMap.lookup(parentStartOp);
+      auto *parentEndOp = endRecordMap.lookup(parentScopeId);
+      if (parentEndOp && domInfo.dominates(parentStartOp, eventOp) &&
+          postDomInfo.postDominates(parentEndOp, eventOp)) {
+        scopeParentIds.push_back({opToIdMap.lookup(eventOp), parentScopeId});
+        break;
+      }
+    }
+  });
 }
 
 void ScopeIdAllocation::visitTerminator(Operation *op,
@@ -306,7 +323,7 @@ void ScopeIdAllocation::visitTerminator(Operation *op,
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(RegionBranchPoint::parent(), regions);
     for (RegionSuccessor &region : regions) {
-      if (region.isParent()) {
+      if (region.isOperation()) {
         successors.emplace_back(br->getBlock(), br->getIterator());
       } else {
         Block &block = region.getSuccessor()->front();
@@ -326,7 +343,7 @@ void ScopeIdAllocation::visitTerminator(Operation *op,
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(operands, regions);
     for (RegionSuccessor &region : regions) {
-      if (region.isParent()) {
+      if (region.isOperation()) {
         Operation *parent = br->getParentOp();
         successors.emplace_back(parent->getBlock(), parent->getIterator());
       } else {
@@ -373,6 +390,13 @@ ModuleScopeIdAllocation::ModuleScopeIdAllocation(ModuleOp moduleOp)
     }
     scopeIdParents[funcOp] = std::move(parents);
   }
+
+  moduleOp.walk([&](Operation *op) {
+    if (!isa<RecordOp, AllocateEventOp>(op))
+      return;
+    if (getOpScopeId(op) > 255)
+      op->emitError("scope id exceeds the 8-bit encoding");
+  });
 }
 
 ScopeIdAllocation::ScopeId

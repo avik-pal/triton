@@ -8,10 +8,12 @@
 #include "mlir/Interfaces/Utils/InferIntRangeCommon.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
+#include <algorithm>
 #include <numeric>
 #include <optional>
 
@@ -65,7 +67,7 @@ namespace tt = mlir::triton;
 namespace {
 
 constexpr int64_t kDefaultMaxTripCount = 1024;
-constexpr uint64_t kDefaultMaxPrograms = 1L << 31; // 2147483648
+constexpr uint64_t kDefaultMaxPrograms = 1ULL << 31; // 2147483648
 
 void getEnclosingLoops(Operation &op, SmallVector<LoopLikeOpInterface> &ops) {
   Operation *currOp = op.getParentOp();
@@ -159,8 +161,8 @@ void inferResultRangesMaxNonNegSigned(Operation *op,
     auto bitWidth =
         mlir::ConstantIntRanges::getStorageBitwidth(result.getType());
     setResultRange(result, ConstantIntRanges::fromSigned(
-                               APInt::getZero(bitWidth).sext(bitWidth),
-                               APInt::getMaxValue(bitWidth).sext(bitWidth)));
+                               APInt::getZero(bitWidth),
+                               APInt::getSignedMaxValue(bitWidth)));
   }
 }
 
@@ -209,80 +211,7 @@ maybeGetAssumedRangeHelper(Operation *assumption, Value anchor, Block *useBlock,
   if (!useBlock || !domInfo->dominates(cmpOp->getBlock(), useBlock))
     return {};
 
-  bool isSigned = true;
-  switch (cmpOp.getPredicate()) {
-  case arith::CmpIPredicate::uge:
-  case arith::CmpIPredicate::ugt:
-  case arith::CmpIPredicate::ule:
-  case arith::CmpIPredicate::ult:
-    isSigned = false;
-  default:
-    break;
-  }
-
-  bool anchorIsLhs = cmpOp.getLhs() == anchor;
-  auto maybeConstantIntValue = getConstantIntValue(
-      getAsOpFoldResult(anchorIsLhs ? cmpOp.getRhs() : cmpOp.getLhs()));
-  if (auto constValue = maybeConstantIntValue) {
-    unsigned bitWidth = ConstantIntRanges::getStorageBitwidth(anchor.getType());
-    assert(bitWidth > 0 && "expected non-zero bitwdith");
-    APInt apVal = {bitWidth, static_cast<uint64_t>(*constValue), isSigned};
-    APInt min, max;
-    if (isSigned) {
-      min = APInt::getSignedMinValue(bitWidth);
-      if (llvm::isa_and_nonnull<mlir::triton::GetProgramIdOp,
-                                mlir::triton::GetNumProgramsOp>(
-              anchor.getDefiningOp())) {
-        min = APInt::getZero(bitWidth);
-      } else
-        min = APInt::getSignedMinValue(bitWidth);
-      max = APInt::getSignedMaxValue(bitWidth);
-    } else {
-      min = APInt::getMinValue(bitWidth);
-      max = APInt::getMaxValue(bitWidth);
-    }
-
-    switch (cmpOp.getPredicate()) {
-    case arith::CmpIPredicate::eq:
-      return mlir::ConstantIntRanges::constant(apVal);
-    case arith::CmpIPredicate::uge:
-    case arith::CmpIPredicate::sge: {
-      // K >= apVal implies K ∈ [apVal, max]
-      if (anchorIsLhs)
-        return mlir::ConstantIntRanges::range(apVal, max, isSigned);
-      // apVal >= K implies K ∈ [min, apVal]
-      return mlir::ConstantIntRanges::range(min, apVal, isSigned);
-    }
-    case arith::CmpIPredicate::ugt:
-    case arith::CmpIPredicate::sgt: {
-      // K > apVal implies K >= apVal + 1 implies K ∈ [apVal + 1, max]
-      if (anchorIsLhs)
-        return mlir::ConstantIntRanges::range(apVal + 1, max, isSigned);
-      // apVal > K implies apVal - 1 >= K implies K ∈ [min, apVal - 1]
-      return mlir::ConstantIntRanges::range(min, apVal - 1, isSigned);
-    }
-    case arith::CmpIPredicate::ule:
-    case arith::CmpIPredicate::sle: {
-      // K <= apVal implies K ∈ [min, apVal]
-      if (anchorIsLhs)
-        return mlir::ConstantIntRanges::range(min, apVal, isSigned);
-      // apVal <= K implies K ∈ [apVal, max]
-      return mlir::ConstantIntRanges::range(apVal, max, isSigned);
-    }
-    case arith::CmpIPredicate::ult:
-    case arith::CmpIPredicate::slt: {
-      // K < apVal implies K <= apVal -1 implies K ∈ [min, apVal - 1]
-      if (anchorIsLhs)
-        return mlir::ConstantIntRanges::range(min, apVal - 1, isSigned);
-      // apVal < K implies apVal + 1 <= K implies K ∈ [apVal + 1, max]
-      return mlir::ConstantIntRanges::range(apVal + 1, max, isSigned);
-    }
-    default:
-      emitRemark(cmpOp.getLoc(), "unsupported cmp predicate for assumption");
-      return {};
-    }
-  }
-  return {};
+  return triton::getBoundFromCmpOp(cmpOp, anchor);
 }
 
 std::optional<ConstantIntRanges>
@@ -346,14 +275,15 @@ TritonIntegerRangeAnalysis::maybeGetTripCount(LoopLikeOpInterface loop) {
         const dataflow::IntegerValueRangeLattice *lattice =
             getLatticeElementFor(getProgramPointBefore(block), value);
         if (lattice != nullptr && !lattice->getValue().isUninitialized())
-          return getUpper ? lattice->getValue().getValue().smax()
-                          : lattice->getValue().getValue().smin();
+          return getUpper.value_or(false)
+                     ? lattice->getValue().getValue().smax()
+                     : lattice->getValue().getValue().smin();
       }
     }
     if (defaultVal)
       return *defaultVal;
-    return getUpper ? APInt::getSignedMaxValue(width)
-                    : APInt::getSignedMinValue(width);
+    return getUpper.value_or(false) ? APInt::getSignedMaxValue(width)
+                                    : APInt::getSignedMinValue(width);
   };
 
   Block *block = iv->getParentBlock();
@@ -378,10 +308,19 @@ TritonIntegerRangeAnalysis::maybeGetTripCount(LoopLikeOpInterface loop) {
   //  step = ceildiv(K, k)
   if (stepVal.isZero())
     stepVal = stepValDefault;
-  if (max.sge(min))
-    return llvm::divideCeilSigned(max.getSExtValue() - min.getSExtValue(),
-                                  stepVal.getSExtValue());
-  return {};
+  if (max.slt(min))
+    return {};
+  // Widest bounds and smallest step give the largest number of iterations the
+  // loop can run. Over-estimating is safe because extra backedges only widen
+  // loop carried values; under-estimating is not. Loops which may not run at
+  // all are handled by always propagating the init args.
+  int64_t tripCount = llvm::divideCeilSigned(
+      max.getSExtValue() - min.getSExtValue(), stepVal.getSExtValue());
+  // A negative count means the subtraction above overflowed, i.e. we do not
+  // have a usable bound on the number of iterations.
+  if (tripCount < 0)
+    return {};
+  return tripCount;
 }
 
 bool isEmptyInitializedRange(ConstantIntRanges rv) {
@@ -413,17 +352,17 @@ collectRanges(const DataFlowSolver &solver, ValueRange values) {
   return ranges;
 }
 
-bool cmpIIsStaticallyTrue(const DataFlowSolver &solver, arith::CmpIOp cmpOp) {
+std::optional<bool> evaluateCmpI(const DataFlowSolver &solver,
+                                 arith::CmpIOp cmpOp) {
   if (auto inputRanges =
           collectRanges(solver, ValueRange{cmpOp.getOperands()})) {
     intrange::CmpPredicate pred =
         static_cast<intrange::CmpPredicate>(cmpOp.getPredicate());
     if (!(*inputRanges)[0] || !(*inputRanges)[1])
-      return false;
-    return intrange::evaluatePred(pred, *(*inputRanges)[0], *(*inputRanges)[1])
-        .value_or(false);
+      return std::nullopt;
+    return intrange::evaluatePred(pred, *(*inputRanges)[0], *(*inputRanges)[1]);
   }
-  return false;
+  return std::nullopt;
 }
 
 LogicalResult TritonIntegerRangeAnalysis::initialize(Operation *top) {
@@ -450,6 +389,22 @@ TritonIntegerRangeAnalysis::getTotalLoopTripCount(LoopLikeOpInterface loop) {
                            return accum * maybeGetTripCount(loop).value_or(
                                               kDefaultMaxTripCount + 1);
                          });
+}
+
+int64_t
+TritonIntegerRangeAnalysis::getLoopSimulationSteps(LoopLikeOpInterface loop) {
+  int64_t steps = getTotalLoopTripCount(loop);
+  // A lattice of this loop changes once per iteration, but also once for every
+  // step a nested loop needs to converge. This keeps the simulation steps
+  // bounded for deeply nested loops.
+  loop->walk([&](LoopLikeOpInterface nested) {
+    if (nested == loop)
+      return;
+    int64_t nestedSteps = getTotalLoopTripCount(nested);
+    if (nestedSteps <= kDefaultMaxTripCount)
+      steps = std::max(steps, nestedSteps);
+  });
+  return steps;
 }
 
 void TritonIntegerRangeAnalysis::setToEntryState(
@@ -613,7 +568,11 @@ LogicalResult TritonIntegerRangeAnalysis::visitOperationHelper(
           op)) {
     llvm::TypeSwitch<Operation *>(op)
         .Case<GetProgramIdOp>([&](auto getPIDOp) {
-          inferResultRangesPID(getPIDOp, kDefaultMaxPrograms - 1, joinCallback);
+          int axis = getPIDOp.getAxisAsInt();
+          auto it = pidBounds.find(axis);
+          uint64_t maxPID =
+              it != pidBounds.end() ? it->second : kDefaultMaxPrograms - 1;
+          inferResultRangesPID(getPIDOp, maxPID, joinCallback);
         })
         .Case<GetNumProgramsOp>([&](auto getPIDOp) {
           inferResultRangesPID(getPIDOp, kDefaultMaxPrograms, joinCallback);
@@ -640,7 +599,7 @@ LogicalResult TritonIntegerRangeAnalysis::visitOperationHelper(
 
   // Ops with actually changing/variable input/output ranges.
   if (llvm::isa<TransOp, SplitOp, BroadcastOp, ReshapeOp, gpu::ConvertLayoutOp,
-                SplatOp, ExpandDimsOp, JoinOp, CatOp, GatherOp>(op)) {
+                SplatOp, ExpandDimsOp, JoinOp, GatherOp>(op)) {
     SmallVector<ConstantIntRanges> argConstIntRanges;
     for (const auto &r : argIntValueRanges) {
       if (r.isUninitialized()) {
@@ -655,7 +614,7 @@ LogicalResult TritonIntegerRangeAnalysis::visitOperationHelper(
           return inferResultRangesUnaryOpForwardArgRange(op, argConstIntRanges,
                                                          joinCallback);
         })
-        .Case<JoinOp, CatOp>([&](auto joinOp) {
+        .Case<JoinOp>([&](auto joinOp) {
           return inferResultRangesBinaryOpUnionArgRanges(
               joinOp, argConstIntRanges, joinCallback);
         })
@@ -702,7 +661,7 @@ void TritonIntegerRangeAnalysis::initializeFuncOp(tt::FuncOp op) {
 
 void TritonIntegerRangeAnalysis::visitRegionSuccessors(
     ProgramPoint *point, RegionBranchOpInterface branch,
-    RegionBranchPoint successor,
+    RegionSuccessor successor,
     ArrayRef<dataflow::AbstractSparseLattice *> abstractLattices) {
   LLVM_DEBUG({
     DBGS() << "Visit Region Succesors of ";
@@ -716,29 +675,37 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
     lattices.push_back(
         static_cast<dataflow::IntegerValueRangeLattice *>(abstractLat));
   }
-  // Initialize loop trip counts
+  // Initialize the number of simulation steps
   LoopLikeOpInterface loop =
       llvm::dyn_cast<LoopLikeOpInterface>(branch.getOperation());
   if (loop) {
-    if (!loopTripCounts.contains(loop)) {
-      loopTripCounts[loop] = std::numeric_limits<int64_t>::max();
+    if (!loopSimulationSteps.contains(loop)) {
+      loopSimulationSteps[loop] = 0;
       for (auto argLat : lattices)
         loopVisits[{loop, argLat}] = 0;
     }
 
-    int64_t loopTripCount = getTotalLoopTripCount(loop);
+    int64_t steps = getLoopSimulationSteps(loop);
     LLVM_DEBUG({
-      DBGS() << "Trip count for ";
+      DBGS() << "Simulation steps for ";
       OpPrintingFlags flags;
       flags.skipRegions(true);
       loop->print(llvm::dbgs(), flags);
       llvm::dbgs() << "\n";
-      DBGS() << " --> " << loopTripCount << '\n';
+      DBGS() << " --> " << steps << '\n';
     });
-    if (loopTripCount < loopTripCounts[loop]) {
-      loopTripCounts[loop] = loopTripCount;
-    }
+    if (steps < 0)
+      steps = kDefaultMaxTripCount + 1;
+    // We can only widen the simulation steps (conservative).
+    loopSimulationSteps[loop] = std::max(loopSimulationSteps[loop], steps);
   }
+
+  // Loop iter_args need init values plus values from simulated iterations.
+  // Loop results need one extra backedge to observe the final iteration's yield
+  int64_t maxBackedges = 0;
+  if (loop)
+    maxBackedges = successor.isOperation() ? loopSimulationSteps[loop]
+                                           : loopSimulationSteps[loop] - 1;
 
   const auto *predecessors =
       getOrCreateFor<dataflow::PredecessorState>(point, point);
@@ -768,6 +735,8 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
   //
   for (Operation *op : predecessors->getKnownPredecessors()) {
     std::optional<OperandRange> operands;
+    // Loop init args are not backedges and should never be blocked or counted.
+    bool isBackedge = loop && op != branch.getOperation();
     if (op == branch) {
       operands = branch.getEntrySuccessorOperands(successor);
     } else if (auto regionTerminator =
@@ -781,38 +750,45 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
     assert(inputs.size() == operands->size() &&
            "expected the same number of successor inputs as operands");
 
+    auto valueToLattices = [&](Value v) { return getLatticeElement(v); };
     unsigned firstIndex = 0;
     if (inputs.size() != lattices.size()) {
       if (!point->isBlockStart()) {
-        if (!inputs.empty()) {
+        if (!inputs.empty())
           firstIndex = cast<OpResult>(inputs.front()).getResultNumber();
-        }
-        visitNonControlFlowArguments(branch,
-                                     RegionSuccessor(branch->getResults().slice(
-                                         firstIndex, inputs.size())),
-                                     lattices, firstIndex);
+        RegionSuccessor parentSuccessor(branch.getOperation());
+        SmallVector<Value> nonSuccessorInputs =
+            branch.getNonSuccessorInputs(parentSuccessor);
+        SmallVector<dataflow::IntegerValueRangeLattice *>
+            nonSuccessorInputLattices =
+                llvm::map_to_vector(nonSuccessorInputs, valueToLattices);
+        visitNonControlFlowArguments(branch, parentSuccessor,
+                                     nonSuccessorInputs,
+                                     nonSuccessorInputLattices);
       } else {
-        if (!inputs.empty()) {
+        if (!inputs.empty())
           firstIndex = cast<BlockArgument>(inputs.front()).getArgNumber();
-        }
         Region *region = point->getBlock()->getParent();
-        visitNonControlFlowArguments(
-            branch,
-            RegionSuccessor(region, region->getArguments().slice(
-                                        firstIndex, inputs.size())),
-            lattices, firstIndex);
+        SmallVector<Value> nonSuccessorInputs =
+            branch.getNonSuccessorInputs(RegionSuccessor(region));
+        SmallVector<dataflow::IntegerValueRangeLattice *>
+            nonSuccessorInputLattices =
+                llvm::map_to_vector(nonSuccessorInputs, valueToLattices);
+        visitNonControlFlowArguments(branch, RegionSuccessor(region),
+                                     nonSuccessorInputs,
+                                     nonSuccessorInputLattices);
       }
     }
 
     for (auto [oper, argLat] :
          llvm::zip(*operands, ArrayRef(lattices).drop_front(firstIndex))) {
       std::pair loopArgLat = {loop, argLat};
-      // If we've "run the loop" #tripcount times, stop propagating.
-      if (loop && loopVisits[loopArgLat] >= loopTripCounts[loop])
+      // If we've "run the loop" #maxBackedges times, stop propagating.
+      if (isBackedge && loopVisits[loopArgLat] >= maxBackedges)
         continue;
 
       ChangeResult changed;
-      if (loop && loopTripCounts[loop] > kDefaultMaxTripCount) {
+      if (loop && loopSimulationSteps[loop] > kDefaultMaxTripCount) {
         // If the loop's tripcount is too large, infer the maximum range for
         // the arg lattices. This will have the effect that all users will
         // also be inferred to have maximum range and end the analysis will
@@ -820,14 +796,17 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
         // further changes/updates are possible).
         changed = argLat->join(IntegerValueRange::getMaxRange(oper));
       } else {
-        // Else, propagate pred operands.
-        auto operLat = *getLatticeElementFor(point, oper);
-        changed = argLat->join(operLat);
+        // Else, propagate pred operands. Known-trip-count loops are bounded by
+        // loopVisits, so join the value directly and avoid LLVM's generic
+        // merge-site widening for long-but-finite loop simulations.
+        auto *operLat = getLatticeElementFor(point, oper);
+        changed =
+            loop ? argLat->join(operLat->getValue()) : argLat->join(*operLat);
         LLVM_DEBUG({
           if (changed == ChangeResult::Change) {
             DBGS() << "Operand lattice ";
             oper.printAsOperand(llvm::dbgs(), {});
-            llvm::dbgs() << " --> " << operLat.getValue() << "\n";
+            llvm::dbgs() << " --> " << operLat->getValue() << "\n";
           }
         });
       }
@@ -836,7 +815,7 @@ void TritonIntegerRangeAnalysis::visitRegionSuccessors(
       // lattice because otherwise we will over count the number of visits
       // (since not all iter_arg lattices are updated/propagated on each
       // visit).
-      if (loop && changed == ChangeResult::Change)
+      if (isBackedge && changed == ChangeResult::Change)
         ++loopVisits[loopArgLat];
     }
   }
@@ -865,16 +844,13 @@ struct FoldTrueCmpIOp : OpRewritePattern<arith::CmpIOp> {
 
   LogicalResult matchAndRewrite(arith::CmpIOp cmpOp,
                                 PatternRewriter &rewriter) const override {
-    if (llvm::isa<IntegerType, IndexType>(cmpOp.getType()) &&
-        cmpIIsStaticallyTrue(*solver, cmpOp)) {
-      if (failed(mlir::dataflow::maybeReplaceWithConstant(*solver, rewriter,
-                                                          cmpOp.getResult()))) {
-        LDBG("failed to replace with constant op: " << cmpOp);
-        return failure();
-      }
-    } else {
+    auto result = evaluateCmpI(*solver, cmpOp);
+    if (!result)
       return failure();
-    }
+
+    TypedAttr constAttr = *result ? rewriter.getOneAttr(cmpOp.getType())
+                                  : rewriter.getZeroAttr(cmpOp.getType());
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(cmpOp, constAttr);
     return success();
   }
 

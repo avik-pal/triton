@@ -1,6 +1,7 @@
 import contextlib
 import pytest
 import os
+import warnings
 
 import torch
 import triton
@@ -75,7 +76,7 @@ def test_err_in_unary_op():
     # ok, but the error message needs to point to the correct spot.
     @triton.jit
     def kernel():
-        not (0, 0)
+        -(0, 0)
 
     with pytest.raises(CompilationError) as e:
         triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
@@ -234,11 +235,8 @@ def test_returns_branched_on_non_constexpr():
     with pytest.raises(CompilationError) as e:
         triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'N': 'i32'}, constexprs={}))
 
-    try:
-        assert "at 2:4:" in str(e.value), "error should point to the function call"
-        assert "at 5:8:" in str(e.value.__cause__), "error should point to the second `return`"
-    except AssertionError as assertion_err:
-        raise assertion_err from e.value
+    assert "at 2:4:" in str(e.value), "error should point to the function call"
+    assert "at 1:0:" in str(e.value.__cause__), "error should point to function definition"
 
 
 def test_power_of_two_shapes():
@@ -336,7 +334,11 @@ def test_defaults_assign_no_err():
     def kernel(a=1, B: tl.constexpr = ""):
         pass
 
-    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'a': 'i32', 'B': 'constexpr'}, constexprs={'B': ""}))
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=r"AnnAssign\.__init__ missing .* 'simple'",
+                                category=DeprecationWarning)
+        triton.compile(
+            triton.compiler.ASTSource(fn=kernel, signature={'a': 'i32', 'B': 'constexpr'}, constexprs={'B': ""}))
 
 
 def test_where_warning(fresh_triton_cache):
@@ -382,7 +384,7 @@ def test_fp8_support(fresh_triton_cache, dtype):
     elif dtype in supported_dtypes:
         ctx = contextlib.nullcontext()
     else:
-        ctx = pytest.raises(CompilationError, match="")
+        ctx = pytest.raises(CompilationError)
 
     with ctx as e:
         triton.compile(
@@ -478,6 +480,62 @@ def test_unused_result():
     assert expected_err_msg == obtained_err_msg
 
 
+@triton.aggregate
+class Square:
+    x: tl.tensor
+
+    @triton.constexpr_function
+    def __init__(self, x):
+        self.x = x
+
+    @triton.must_use_result
+    @triton.constexpr_function
+    def power(self):
+        return 2
+
+    @triton.must_use_result
+    @triton.jit
+    def compute(self):
+        return self.x * self.x
+
+
+def test_bound_unused_result():
+
+    @triton.jit
+    def evil_square_kernel():
+        a = Square(tl.full((64, 64), 0.0, tl.float32))
+        a.compute()
+
+    @triton.jit
+    def good_square_kernel():
+        a = Square(tl.full((64, 64), 0.0, tl.float32))
+        a = a.compute()
+
+    triton.compile(triton.compiler.ASTSource(fn=good_square_kernel, signature={}, constexprs={}))
+
+    with pytest.raises(CompilationError) as e:
+        triton.compile(triton.compiler.ASTSource(fn=evil_square_kernel, signature={}, constexprs={}))
+
+    assert "The result of a.compute is not being used" in str(e.value)
+
+    @triton.jit
+    def evil_power_kernel():
+        a = Square(tl.full((64, 64), 0.0, tl.float32))
+        a.power()
+
+    @triton.jit
+    def good_power_kernel():
+        a = Square(tl.full((64, 64), 0.0, tl.float32))
+        a = a.power()
+
+    triton.compile(triton.compiler.ASTSource(fn=good_power_kernel, signature={}, constexprs={}))
+
+    with pytest.raises(CompilationError) as e:
+        triton.compile(triton.compiler.ASTSource(fn=evil_power_kernel, signature={}, constexprs={}))
+
+    assert "The result of a.power is not being used" in str(e.value)
+
+
 def test_err_constexpr_and_do_not_specialize():
 
     @triton.jit(do_not_specialize=["N"])
@@ -508,4 +566,39 @@ def test_dot_scaled_shape_verification(fresh_triton_cache):
     with pytest.raises(CompilationError) as e:
         triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constexprs={}))
 
-    assert str(e.value.__cause__) == "lhs_scale must be a tensor of shape [32, 2]. Got ['32', '4']"
+    assert str(e.value.__cause__) == "Operands must have the same scale factor; (lhs: 16 vs rhs: 32)"
+
+
+def test_err_nested_function_def():
+
+    @triton.jit
+    def kernel(ptr, n, BLOCK: tl.constexpr):
+
+        def combine(a, b):
+            return a + b
+
+        offs = tl.arange(0, BLOCK)
+        tl.store(ptr + offs, tl.load(ptr + offs))
+
+    with pytest.raises(CompilationError) as e:
+        triton.compile(
+            triton.compiler.ASTSource(fn=kernel, signature={"ptr": "*fp32", "n": "i32"}, constexprs={"BLOCK": 128}))
+
+    err_msg = format_exception(e.type, value=e.value, tb=e.tb)
+    assert "StopIteration" not in err_msg, "nested def should not leak StopIteration"
+    assert "nested function" in err_msg, "error should mention nested function"
+
+
+@pytest.mark.parametrize("ptr_ty", ["*i8", "*i16", "*i64"])
+def test_err_histogram_non_32bit_int(ptr_ty):
+
+    @triton.jit
+    def kernel(x_ptr, z_ptr, N: tl.constexpr):
+        x = tl.load(x_ptr + tl.arange(0, 8))
+        tl.store(z_ptr + tl.arange(0, N), tl.histogram(x, N))
+
+    with pytest.raises(CompilationError) as e:
+        triton.compile(
+            triton.compiler.ASTSource(fn=kernel, signature={"x_ptr": ptr_ty, "z_ptr": "*i32", "N": "constexpr"},
+                                      constexprs={"N": 4}))
+    assert "histogram only supports 32-bit integer input" in str(e.value.__cause__)

@@ -6,7 +6,8 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/Sys/GetEnv.h"
 
 namespace ttg = mlir::triton::gpu;
 
@@ -19,11 +20,9 @@ namespace nvidia_gpu {
 
 namespace {
 template <class MMAOpTy>
-Attribute getLHSTMemLayout(MMAOpTy tcGen5MMAOp, gpu::MemDescType lhsTMEMType,
-                           ttg::CTALayoutAttr ctaLayout) {
+Attribute getLHSTMemLayout(MMAOpTy tcGen5MMAOp, gpu::MemDescType lhsTMEMType) {
   int numWarps = ttg::lookupNumWarps(tcGen5MMAOp);
-  return nvidia_gpu::getDefaultLayoutForTmemLdSt(lhsTMEMType, numWarps,
-                                                 ctaLayout);
+  return nvidia_gpu::getDefaultLayoutForTmemLdSt(lhsTMEMType, numWarps);
 }
 
 template <class MMAOpTy> class LHSToTMem : public OpRewritePattern<MMAOpTy> {
@@ -46,21 +45,22 @@ public:
     auto srcLayout = srcType.getEncoding();
     auto accTMemEncoding = dyn_cast<TensorMemoryEncodingAttr>(
         tcGen5MMAOp.getD().getType().getEncoding());
-    ArrayRef<unsigned> CTASplitNum =
-        triton::gpu::getCTALayout(srcLayout).getCTASplitNum();
-    // TMem encoding for A operand is the same as for D (Acc), but packed for
-    // bitwidth=16
+    auto cgaLayout = triton::gpu::getCGALayout(srcLayout);
+    // TMem encoding for A operand is the same as for D (Acc), with colStride 1,
+    // i.e. densely packed in TMEM.
     unsigned elemBitWidth =
         lhs.getType().getElementType().getIntOrFloatBitWidth();
-    // We don't currently support fp8 (not sure if we can)
-    if (elemBitWidth != 16 && elemBitWidth != 32) {
+    if (!llvm::is_contained({8, 16, 32}, elemBitWidth)) {
+      return failure();
+    }
+    // Padded fp4 operand cannot be trivially promoted to TMEM.
+    if (isFp4Padded(lhs.getType().getEncoding())) {
       return failure();
     }
     const unsigned colStride = 1;
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
         context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        colStride, CTASplitNum[0], CTASplitNum[1],
-        accTMemEncoding.getTwoCTAs());
+        colStride, cgaLayout, accTMemEncoding.getTwoCTAs());
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     ttg::MemDescType lhsMemDescType = ttg::MemDescType::get(
@@ -73,8 +73,7 @@ public:
     if (!layoutTmemCompatible) {
       if (!comesFromLoadOrBlockArg(src) ||
           triton::tools::getBoolEnv("ALLOW_LHS_TMEM_LAYOUT_CONVERSION")) {
-        newLayout = getLHSTMemLayout(tcGen5MMAOp, lhsMemDescType,
-                                     ttg::getCTALayout(srcType.getEncoding()));
+        newLayout = getLHSTMemLayout(tcGen5MMAOp, lhsMemDescType);
       } else {
         return failure();
       }

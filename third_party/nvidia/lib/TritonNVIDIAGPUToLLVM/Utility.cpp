@@ -122,7 +122,7 @@ Value permute(Location loc, RewriterBase &rewriter, Value a, Value b,
 }
 
 /// Create a predicate with just single active thread.
-Value createElectPredicate(Location loc, RewriterBase &rewriter) {
+Value createElectPredicate(Location loc, OpBuilder &rewriter) {
   return NVVM::ElectSyncOp::create(rewriter, loc, i1_ty,
                                    /*membermask=*/Value());
 }
@@ -132,11 +132,64 @@ void createSyncWarp(Location loc, OpBuilder &rewriter) {
   NVVM::SyncWarpOp::create(rewriter, loc, b.i32_val(0xffffffff));
 }
 
-Value createElectPredicateWarp0(Location loc, RewriterBase &rewriter) {
+Value createElectPredicateWarp0(Location loc, OpBuilder &rewriter) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value warpId = getLaneAndWarpId(rewriter, loc).second;
   Value warp0 = b.icmp_eq(warpId, b.i32_val(0));
   return b.and_(warp0, createElectPredicate(loc, rewriter));
+}
+
+Value createTMAMulticastMask(Location loc, ConversionPatternRewriter &rewriter,
+                             uint16_t broadcastBits, Value ctaId) {
+  int numCTAs = triton::gpu::lookupNumCTAs(rewriter);
+  auto encoding =
+      triton::nvidia_gpu::getTMAMulticastMaskEncoding(numCTAs, broadcastBits);
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  if (!ctaId)
+    ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+  Value base = b.and_(ctaId, b.i32_val(encoding.fixedBits));
+  return b.shl(b.i32_val(encoding.pattern), base);
+}
+
+uint32_t getCGABroadcastMask(mlir::triton::gpu::MemDescType barrierTy) {
+  auto kBlock = StringAttr::get(barrierTy.getContext(), "block");
+  return toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
+}
+
+std::optional<Value>
+getLeaderCTAPredicate(Location loc, ConversionPatternRewriter &rewriter,
+                      mlir::triton::gpu::MemDescType barrierTy) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  uint32_t maskCGABroadcast = getCGABroadcastMask(barrierTy);
+  if (!maskCGABroadcast)
+    return std::nullopt;
+
+  Value ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+  Value ctaIdInGroup = b.and_(ctaId, b.i32_val(maskCGABroadcast));
+  return std::optional<Value>(b.icmp_eq(ctaIdInGroup, b.i32_val(0)));
+}
+
+Value getLeaderAddress(Location loc, ConversionPatternRewriter &rewriter,
+                       Value barrierPtr,
+                       mlir::triton::gpu::MemDescType barrierTy) {
+  uint32_t barrierMask = getCGABroadcastMask(barrierTy);
+  if (!barrierMask)
+    return barrierPtr;
+
+  // Trick from cutlass to implement a faster `mapa` via a single and
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  uint32_t fullMask = ~(barrierMask << 24);
+  Value barrierInt = b.ptrtoint(i32_ty, barrierPtr);
+  barrierInt = b.and_(barrierInt, b.i32_val(fullMask));
+  return b.inttoptr(barrierPtr.getType(), barrierInt);
+}
+
+Value createLeadCTAPredicate(Location loc, RewriterBase &rewriter) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value leftClusterId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+  leftClusterId = b.and_(leftClusterId, b.i32_val(1));
+  Value cluster0 = b.icmp_eq(leftClusterId, b.i32_val(0));
+  return cluster0;
 }
 
 LogicalResult lowerLdStMatrix(
@@ -160,8 +213,8 @@ LogicalResult lowerLdStMatrix(
   auto kReg = S("register");
   auto kLane = S("lane");
   auto kWarp = S("warp");
-  auto kBlock = S("block");
   auto kOffset = S("offset");
+  auto kBlock = S("block");
   auto kAddr = S("addr");
   auto smemPtrTy = ptr_ty(ctx, 3);
   auto bitwidth = getIntOrFloatOrPtrBitWidth(llvmElemTy);
@@ -170,9 +223,6 @@ LogicalResult lowerLdStMatrix(
   if ((!transpose && bitwidth > 32) ||
       (transpose && !(bitwidth == 16 ||
                       (bitwidth == 8 && targetInfo.supportLdStMatrixB8()))))
-    return failure();
-  // Inter block stmatrix is not supported
-  if (cvt.hasInDim(kBlock))
     return failure();
 
   // Map onto offsets (contiguous part) and addr (non-contiguous part)
@@ -284,7 +334,7 @@ LogicalResult lowerLdStMatrix(
 
   // If we are lowering a subslice, the subslice offsets shall not touch the
   // contiguous part of the tile
-  if (maskSpanAffineOffset & (tile.getOutDimSizeLog2(kOffset) - 1)) {
+  if (maskSpanAffineOffset & (tile.getOutDimSize(kOffset) - 1)) {
     return failure();
   }
 
@@ -310,10 +360,17 @@ LogicalResult lowerLdStMatrix(
       LinearLayout({{kLane, addrToOffset.getBases().lookup(kAddr)},
                     {kWarp, reps.getBases().lookup(kWarp)}},
                    {{kOffset, reps.getOutDimSize(kOffset)}}, false);
+
+  // Matrix accesses are CTA-local. Model that with a trivial block output so
+  // additive stride analysis always compares (offset, block) components.
+  reps =
+      reps.reshapeOuts({{kOffset, reps.getOutDimSize(kOffset)}, {kBlock, 1}});
+  addrLayout = addrLayout.reshapeOuts(reps.getOutDims());
   // Compute the bits that are moved by one instruction
   // Compute elements for which we can swap the xor by an add
-  auto [nAdditive, permStrides] =
-      actionAdditiveStrides(reps, addrLayout, maskSpanAffineOffset);
+  auto [nAdditive, permStrides] = actionAdditiveStrides(
+      reps, addrLayout, maskSpanAffineOffset, /*maskSpanBlocks=*/0,
+      fullTileVec.getInDimSize(kReg));
   reps = permStrides.apply(reps);
   if (isStore) {
     vals = permStrides.apply(vals);

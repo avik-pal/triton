@@ -1,8 +1,8 @@
 // RUN: split-file %s %t
 // RUN: cat %t/common.mlir %t/mfma0.mlir > %t/run-mfma0.mlir
-// RUN: triton-opt %t/run-mfma0.mlir -split-input-file --tritonamdgpu-accelerate-matmul="arch-generation-name=gfx942 matrix-instruction-size=0" --verify-diagnostics | FileCheck %t/run-mfma0.mlir --check-prefixes=MFMA0,CHECK
+// RUN: triton-opt %t/run-mfma0.mlir -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx942 matrix-instruction-size=0" --verify-diagnostics | FileCheck %t/run-mfma0.mlir --check-prefixes=MFMA0,CHECK
 // RUN: cat %t/common.mlir %t/mfma16.mlir > %t/run-mfma16.mlir
-// RUN: triton-opt %t/run-mfma16.mlir -split-input-file --tritonamdgpu-accelerate-matmul="arch-generation-name=gfx942 matrix-instruction-size=16" --verify-diagnostics | FileCheck %t/run-mfma16.mlir --check-prefixes=MFMA16,CHECK
+// RUN: triton-opt %t/run-mfma16.mlir -split-input-file --tritonamdgpu-accelerate-matmul="gfx-arch=gfx942 matrix-instruction-size=16" --verify-diagnostics | FileCheck %t/run-mfma16.mlir --check-prefixes=MFMA16,CHECK
 
 //--- common.mlir
 
@@ -55,7 +55,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // MFMA0: #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 2], instrShape = [4, 64, 64], isTransposed = false}>
 // MFMA16: #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 2], instrShape = [16, 16, 16], isTransposed = true}>
 // CHECK-LABEL: small_m_size_mfma
-#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 2], order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 2], order = [1, 0]}>
 module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @small_m_size_mfma(
     %a: tensor<4x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>,
@@ -94,7 +94,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 // MFMA0-NOT: amd_mfma
 // MFMA16: #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 2], instrShape = [16, 16, 16], isTransposed = true}>
 // CHECK-LABEL: small_m_size_fma
-#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 2], order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 2], order = [1, 0]}>
 module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @small_m_size_fma(
     %a: tensor<1x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>,
@@ -113,7 +113,7 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
 // MFMA0-NOT: amd_mfma
 // MFMA16: #mma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [1, 2], instrShape = [16, 16, 16], isTransposed = true}>
 // CHECK-LABEL: small_m_size_fma
-#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 2], order = [1, 0], CTAsPerCGA = [1, 1], CTASplitNum = [1, 1], CTAOrder = [1, 0]}>
+#blocked = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 64], warpsPerCTA = [1, 2], order = [1, 0]}>
 module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @small_m_size_fma(
     %a: tensor<1x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>,

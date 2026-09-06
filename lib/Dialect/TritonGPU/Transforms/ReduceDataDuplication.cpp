@@ -42,7 +42,7 @@ public:
           dyn_cast<triton::gpu::DotOperandEncodingAttr>(dstType.getEncoding());
       if (!dstDotOp)
         return;
-      if (!cvtNeedsSharedMemory(srcType, dstType))
+      if (!cvtNeedsSharedMemory(cvtOp))
         return;
       auto order = getOrderForMemory(srcType);
       auto sharedMemorySpace =
@@ -51,7 +51,7 @@ public:
           dstType.getShape(), dstType.getElementType(),
           triton::gpu::SwizzledSharedEncodingAttr::get(
               mod.getContext(), dstDotOp, srcType.getShape(), order,
-              triton::gpu::getCTALayout(srcEncoding), srcType.getElementType()),
+              triton::gpu::getCGALayout(srcEncoding), srcType.getElementType()),
           sharedMemorySpace);
       auto tmp = triton::gpu::LocalAllocOp::create(builder, cvtOp.getLoc(),
                                                    tmpType, cvtOp.getSrc());

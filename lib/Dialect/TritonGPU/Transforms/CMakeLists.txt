@@ -5,6 +5,7 @@ add_triton_library(TritonGPUTransforms
   FuseNestedLoops.cpp
   CombineTensorSelectAndIf.cpp
   DecomposeScaledBlocked.cpp
+  DescriptorMemoryLayouts.cpp
   HoistTMEMAlloc.cpp
   ReduceDataDuplication.cpp
   OptimizeAccumulatorInit.cpp
@@ -27,13 +28,16 @@ add_triton_library(TritonGPUTransforms
   ReorderInstructions.cpp
   CoalesceAsyncCopy.cpp
   Utility.cpp
+  CoalesceUtils.cpp
   LayoutPropagationUtility.cpp
   WarpSpecialization/AutomaticWarpSpecialization.cpp
+  WarpSpecialization/NormalizeWSWhileLoops.cpp
   WarpSpecialization/Partition.cpp
   WarpSpecialization/OptimizePartitionWarps.cpp
   WarpSpecialization/PartitionBuilder.cpp
   WarpSpecialization/PartitionLoops.cpp
   WarpSpecialization/PartitionScheduling.cpp
+  WarpSpecialization/PartitionSchedulingUtility.cpp
 
   DEPENDS
   TritonGPUTransformsIncGen

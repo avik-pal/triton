@@ -57,16 +57,61 @@ template <typename T, typename OP> bool hasOperator(T *o) {
   return exist;
 }
 
+template <typename T> bool hasProtonEvent(T *o) {
+  bool exists = false;
+  o->walk([&](Operation *op) {
+    if (isa<proton::RecordOp, proton::EventOp, proton::AllocateEventOp>(op)) {
+      exists = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return exists;
+}
+
 void instrumentWarpSpecializeOps(FuncOp func, Value buffer, Value profileMem) {
   for (auto wsOp : func.getOps<triton::gpu::WarpSpecializeOp>()) {
     auto loc = wsOp.getLoc();
-    if (hasOperator<Operation, proton::RecordOp>(wsOp.getOperation())) {
-      wsOp->insertOperands(wsOp->getNumOperands(), {buffer, profileMem});
+    if (hasProtonEvent(wsOp.getOperation())) {
+      auto partOp = wsOp.getPartitionOp();
+      partOp->insertOperands(partOp->getNumOperands(), {buffer, profileMem});
       for (Region *region : wsOp.getPartitionRegions()) {
         region->addArgument(buffer.getType(), loc);
         region->addArgument(profileMem.getType(), loc);
       }
     }
+  }
+}
+
+void lowerEvent(OpBuilder &builder, Operation *op, Value targetSegment,
+                IntegerType clkType, MetricType metricType,
+                ModuleScopeIdAllocation &scopeInfo) {
+  builder.setInsertionPoint(op);
+  if (auto eventAlloc = dyn_cast<proton::AllocateEventOp>(op)) {
+    int scopeId = scopeInfo.getOpScopeId(eventAlloc);
+    Value event =
+        arith::ConstantIntOp::create(builder, eventAlloc.getLoc(), scopeId, 32);
+    eventAlloc.getEvent().replaceAllUsesWith(event);
+    eventAlloc.erase();
+    return;
+  }
+
+  Value counter =
+      gpu::ReadCounterOp::create(builder, op->getLoc(), clkType, metricType);
+
+  if (auto record = dyn_cast<proton::RecordOp>(op)) {
+    int scopeId = scopeInfo.getOpScopeId(record);
+    gpu::CircularStoreOp::create(builder, record.getLoc(), targetSegment,
+                                 counter, Value(), record.getIsStart(),
+                                 builder.getI32IntegerAttr(scopeId));
+    record.erase();
+    return;
+  }
+  if (auto event = dyn_cast<proton::EventOp>(op)) {
+    gpu::CircularStoreOp::create(builder, event.getLoc(), targetSegment,
+                                 counter, event.getEvent(), event.getIsStart(),
+                                 IntegerAttr());
+    event.erase();
   }
 }
 
@@ -78,11 +123,11 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
       clockExtension ? mlir::IntegerType::get(builder.getContext(), 64)
                      : mlir::IntegerType::get(builder.getContext(), 32);
 
-  // Replace all proton::RecordOp in the worker warps.
+  // Replace all Proton events in the worker warps.
   func->walk([&](triton::gpu::WarpSpecializePartitionsOp partitions) {
     for (auto &partition : partitions.getPartitionRegions()) {
       auto loc = partitions.getLoc();
-      if (hasOperator<Region, proton::RecordOp>(&partition)) {
+      if (hasProtonEvent(&partition)) {
         Block &block = partition.front();
         builder.setInsertionPointToStart(&block);
         int argNum = block.getNumArguments();
@@ -96,16 +141,12 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
         // Restore warp-level context before profiling.
         gpu::RestoreCtxOp::create(builder, loc, newSegment, profileMemArg);
 
-        // Replace all proton::RecordOp.
-        partition.walk([&](proton::RecordOp record) {
-          builder.setInsertionPoint(record);
-
-          Value counter = gpu::ReadCounterOp::create(builder, record.getLoc(),
-                                                     clkType, metricType);
-          int scopeId = scopeInfo.getOpScopeId(record);
-          gpu::CircularStoreOp::create(builder, record.getLoc(), newSegment,
-                                       counter, record.getIsStart(), scopeId);
-          record.erase();
+        // Replace all Proton events.
+        partition.walk([&](Operation *op) {
+          if (!isa<proton::RecordOp, proton::EventOp, proton::AllocateEventOp>(
+                  op))
+            return;
+          lowerEvent(builder, op, newSegment, clkType, metricType, scopeInfo);
         });
 
         // Finalize and save warp-level context before each warp returns.
@@ -122,17 +163,13 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
     }
   });
 
-  // Replace all proton::RecordOp in the master warps. For the master warps, we
+  // Replace all Proton events in the master warps. For the master warps, we
   // don't need to restore warp-level context and we save the context in the end
   // of kernel (right before FinalizeOp).
-  func->walk([&](proton::RecordOp record) {
-    builder.setInsertionPoint(record);
-    Value counter = gpu::ReadCounterOp::create(builder, record.getLoc(),
-                                               clkType, metricType);
-    int scopeId = scopeInfo.getOpScopeId(record);
-    gpu::CircularStoreOp::create(builder, record.getLoc(), segment, counter,
-                                 record.getIsStart(), scopeId);
-    record.erase();
+  func->walk([&](Operation *op) {
+    if (!isa<proton::RecordOp, proton::EventOp, proton::AllocateEventOp>(op))
+      return;
+    lowerEvent(builder, op, segment, clkType, metricType, scopeInfo);
   });
 
   return success();
@@ -141,8 +178,6 @@ LogicalResult replaceProtonRecordOp(OpBuilder &builder, FuncOp func,
 int getAllocSharedMemSize(int maxSharedMemSize, int sharedMemUsed,
                           int segmentNum) {
   const int bytesPerEntry = gpu::getBytesPerClockEntry();
-  const int wordsPerEntry = bytesPerEntry / 4; // 1 word = 4 bytes
-  const int circularHeaderSize = gpu::getCircularHeaderSize(); // byte size
   sharedMemUsed = llvm::alignTo(sharedMemUsed, bytesPerEntry);
   if (sharedMemUsed >= maxSharedMemSize) {
     // We just assume there's enough shared memory and error out if not during
@@ -155,8 +190,8 @@ int getAllocSharedMemSize(int maxSharedMemSize, int sharedMemUsed,
   int numSharedEntries = segmentByteSizeShared * segmentNum / bytesPerEntry;
   int allocSharedMemSize = numSharedEntries * bytesPerEntry;
 
-  int estimatedOccupany = maxSharedMemSize / std::max(1, sharedMemUsed);
-  if (estimatedOccupany <= 1)
+  int estimatedOccupancy = maxSharedMemSize / std::max(1, sharedMemUsed);
+  if (estimatedOccupancy <= 1)
     return allocSharedMemSize;
 
   int maxAllocSharedMemSize = maxSharedMemSize * maxSharedMemRatio;
@@ -218,8 +253,11 @@ public:
       sharedMemUsed =
           mod->getAttrOfType<mlir::IntegerAttr>("ttg.shared").getInt();
 
-    int allocSharedMemSize =
-        getAllocSharedMemSize(maxSharedMemSize, sharedMemUsed, segmentNum);
+    int numCTAs = triton::gpu::lookupNumCTAs(func);
+    auto maxSharedMemSizePerCTA = maxSharedMemSize / numCTAs;
+
+    int allocSharedMemSize = getAllocSharedMemSize(maxSharedMemSizePerCTA,
+                                                   sharedMemUsed, segmentNum);
 
     const int bytesPerEntry = gpu::getBytesPerClockEntry();
 
@@ -243,7 +281,7 @@ public:
       if (bufferSize > 0)
         allocBufferSize = bufferSize.getValue();
       else
-        allocBufferSize = 16384 * segmentNum;
+        allocBufferSize = 16384 * segmentNum; // 16KB per profiling unit
     } else {
       mlir::emitError(loc, "buffer-type not supported");
       return failure();
@@ -274,23 +312,23 @@ public:
            llvm::Twine(allocProfileScratchSize) + " bytes.");
     }
 
-    Value profileMem = gpu::GlobalScratchAllocOp::create(
+    Value profileMem = triton::gpu::GlobalScratchAllocOp::create(
         builder, loc, triton::getPointerType(builder.getI32Type()),
-        allocProfileScratchSize, profileScratchAlignment);
+        allocProfileScratchSize, profileScratchAlignment,
+        builder.getUnitAttr());
     gpu::InitializeOp::create(builder, loc, profileMem);
 
     Value segment;
     Value buffer;
     if (bufferType == gpu::BufferType::SHARED) {
-      auto ctaLayout = triton::gpu::CTALayoutAttr::get(
-          context, /*CTAsPerCGA=*/{1},
-          /*CTASplitNum=*/{1}, /*CTAOrder=*/{0});
+      auto cgaLayout =
+          triton::gpu::CGAEncodingAttr::get1DLayout(context, numCTAs);
       auto encoding = triton::gpu::SwizzledSharedEncodingAttr::get(
-          context, 1, 1, 1, {0}, ctaLayout);
+          context, 1, 1, 1, {0}, cgaLayout);
       Attribute sharedMemorySpace =
           triton::gpu::SharedMemorySpaceAttr::get(context);
       auto sharedBufferType = triton::gpu::MemDescType::get(
-          {allocBufferSize / 4}, builder.getI32Type(), encoding,
+          {allocBufferSize / 4, 1}, builder.getI32Type(), encoding,
           sharedMemorySpace, /*mutable_memory=*/true);
       buffer =
           triton::gpu::LocalAllocOp::create(builder, loc, sharedBufferType);
@@ -331,7 +369,11 @@ public:
 
     func.walk([&](triton::ReturnOp ret) {
       builder.setInsertionPoint(ret);
-      mlir::gpu::BarrierOp::create(builder, loc);
+      mlir::triton::gpu::BarrierOp::create(
+          builder, loc,
+          triton::gpu::AddrSpace::Local | triton::gpu::AddrSpace::GlobalRead |
+              triton::gpu::AddrSpace::GlobalWrite);
+
       gpu::FinalizeOp::create(builder, loc, segment, profileMem);
     });
 
@@ -362,9 +404,9 @@ public:
 
     FuncOp func = *m.getOps<triton::FuncOp>().begin();
 
-    // Check if there are any proton records to process
-    if (!hasOperator<Operation, proton::RecordOp>(func.getOperation())) {
-      return; // No proton records to process, silently return
+    // Check if there are any Proton events to process.
+    if (!hasProtonEvent(func.getOperation())) {
+      return; // No Proton events to process, silently return.
     }
 
     // Validate profile scratch alignment

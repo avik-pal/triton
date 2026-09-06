@@ -2,7 +2,8 @@
 Persistent Matmul
 =====================
 This script demonstrates persistent kernel implementations of matrix multiplication using Triton.
-Various matmul methods are included, such as naive, persistent, and TMA (Tensor Memory Accelerator) based approaches.
+Various matmul methods are included, such as naive, persistent, TMA (Tensor Memory Accelerator), and CLC TMA based
+approaches. The CLC variant requires an NVIDIA GPU with compute capability >= 10.0.
 The kernels support both FP16 and FP8 data types but the FP8 implementation is only available on CUDA devices with compute capability >= 9.0.
 
 Triton and cuBLAS implementations are benchmarked under different configurations and evaluated using the proton profiler.
@@ -13,7 +14,7 @@ Users can pass command-line arguments to specify matrix dimensions and iteration
     # FP8
     python 09-persistent-matmul.py --prec fp8 --K_range 128 1024 --K_step 128
 
-    # FP16
+    # FP16 (includes CLC variants on supported devices)
     python 09-persistent-matmul.py --prec fp16 --K_range 128 1024 --K_step 128
 
 Note that currently this tutorial will fail on devices with a small shared memory size, such as RTX-4090.
@@ -31,16 +32,29 @@ from contextlib import contextmanager
 
 from typing import Optional
 
-if torch.cuda.is_available():
-    from triton._C.libtriton import nvidia
-    cublas_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
-    cublas = nvidia.cublas.CublasLt(cublas_workspace)
-else:
-    cublas = None
-
 
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+if is_cuda():
+    from triton._C.libtriton import nvidia
+    device_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    device_blas = nvidia.cublas.CublasLt(device_workspace)
+elif is_hip():
+    from triton._C.libtriton import amd
+    device_workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    device_blas = amd.hipblas.HipblasLt(device_workspace)
+else:
+    device_blas = None
+
+
+def device_blas_name():
+    return 'cuBLAS' if is_cuda() else 'hipBLAS'
 
 
 def supports_tma():
@@ -53,6 +67,10 @@ def is_hopper():
 
 def supports_ws():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+
+
+def supports_clc():
+    return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
 
 
 def _matmul_launch_metadata(grid, kernel, args):
@@ -72,6 +90,7 @@ def _matmul_launch_metadata(grid, kernel, args):
 HAS_TENSOR_DESC = supports_tma() and hasattr(tl, "make_tensor_descriptor")
 HAS_HOST_TENSOR_DESC = supports_tma() and hasattr(triton.tools.tensor_descriptor, "TensorDescriptor")
 HAS_WARP_SPECIALIZE = supports_ws() and HAS_TENSOR_DESC
+HAS_TMA_CLC = supports_clc() and HAS_HOST_TENSOR_DESC
 
 
 def matmul_get_configs(pre_hook=None):
@@ -432,6 +451,93 @@ def matmul_kernel_tma_persistent(a_desc, b_desc, c_desc,  #
             c_desc.store([offs_am_c, offs_bn_c], accumulator)
 
 
+# Blackwell-only CLC scheduling keeps the full logical grid. The clc=True
+# launch option makes the compiler wrap this one-tile kernel in the persistent
+# CLC scheduling loop.
+@triton.autotune(
+    configs=matmul_tma_persistent_get_configs(pre_hook=matmul_tma_set_block_size_hook),
+    key=["M", "N", "K", "WARP_SPECIALIZE"],
+)
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def matmul_kernel_tma_clc(a_desc, b_desc, c_desc,  #
+                          M, N, K,  #
+                          BLOCK_SIZE_M: tl.constexpr,  #
+                          BLOCK_SIZE_N: tl.constexpr,  #
+                          BLOCK_SIZE_K: tl.constexpr,  #
+                          GROUP_SIZE_M: tl.constexpr,  #
+                          FP8_OUTPUT: tl.constexpr,  #
+                          EPILOGUE_SUBTILE: tl.constexpr,  #
+                          WARP_SPECIALIZE: tl.constexpr,  #
+                          ):
+    dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
+
+    tile_id = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+    offs_am = pid_m * BLOCK_SIZE_M
+    offs_bn = pid_n * BLOCK_SIZE_N
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for ki in tl.range(k_tiles, warp_specialize=WARP_SPECIALIZE):
+        offs_k = ki * BLOCK_SIZE_K
+        a = a_desc.load([offs_am, offs_k])
+        b = b_desc.load([offs_bn, offs_k])
+        accumulator = tl.dot(a, b.T, accumulator)
+
+    # Epilogue subtiling is a technique to break our computation and stores into multiple pieces
+    # By subtiling we can reduce shared memory consumption by the epilogue and instead use that
+    # memory to increase our stage count.
+    # In this case we partition the accumulator into 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
+    if EPILOGUE_SUBTILE:
+        acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc0, acc1 = tl.split(acc)
+        c0 = acc0.to(dtype)
+        c_desc.store([offs_am, offs_bn], c0)
+        c1 = acc1.to(dtype)
+        c_desc.store([offs_am, offs_bn + BLOCK_SIZE_N // 2], c1)
+    else:
+        accumulator = accumulator.to(dtype)
+        c_desc.store([offs_am, offs_bn], accumulator)
+
+
+def matmul_tma_clc(a, b, warp_specialize: bool):
+    assert HAS_TMA_CLC, "CLC TMA requires an NVIDIA SM100+ GPU with tensor descriptor support"
+    assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+
+    M, K = a.shape
+    N, K = b.shape
+    dtype = a.dtype
+    c = torch.empty((M, N), device=a.device, dtype=dtype)
+
+    dummy_block = [1, 1]
+    a_desc = TensorDescriptor.from_tensor(a, dummy_block)
+    b_desc = TensorDescriptor.from_tensor(b, dummy_block)
+    c_desc = TensorDescriptor.from_tensor(c, dummy_block)
+
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+
+    matmul_kernel_tma_clc[grid](
+        a_desc, b_desc, c_desc,  #
+        M, N, K,  #
+        FP8_OUTPUT=dtype == torch.float8_e4m3fn,  #
+        WARP_SPECIALIZE=warp_specialize,  #
+        clc=True,  #
+    )
+    return c
+
+
 def matmul_tma_persistent(a, b, warp_specialize: bool):
     # Check constraints.
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
@@ -592,7 +698,7 @@ def matmul_descriptor_persistent(a, b, warp_specialize: bool):
     return c
 
 
-def cublas_matmul(a, b):
+def device_blas_matmul(a, b):
     # Check constraints.
     assert a.shape[1] == b.shape[1], "Incompatible dimensions"  # b is transposed
     M, K = a.shape
@@ -601,9 +707,10 @@ def cublas_matmul(a, b):
     c = torch.empty((M, N), device=a.device, dtype=dtype)
     bytes_per_elem = a.element_size()
     flops_str = f"flops{bytes_per_elem * 8}"
-    with proton.scope(f"cublas [M={M}, N={N}, K={K}]",
+    blas_name = device_blas_name()
+    with proton.scope(f"{blas_name} [M={M}, N={N}, K={K}]",
                       {"bytes": bytes_per_elem * (M * K + N * K + M * N), flops_str: 2. * M * N * K}):
-        cublas.matmul(a, b, c)
+        device_blas.matmul(a, b, c)
     return c
 
 
@@ -645,8 +752,9 @@ def bench(K, dtype, reps=10000, warmup_reps=10000):
 
     b = b.T.contiguous()
 
-    if cublas is not None:
-        bench_fn("cublas", reps, warmup_reps, cublas_matmul, a, b)
+    if device_blas is not None:
+        blas_name = device_blas_name()
+        bench_fn(blas_name, reps, warmup_reps, device_blas_matmul, a, b)
     if dtype == torch.float16:
         bench_fn("torch", reps, warmup_reps, torch_matmul, a, b)
     bench_fn("naive", reps, warmup_reps, matmul, a, b.T)
@@ -656,6 +764,8 @@ def bench(K, dtype, reps=10000, warmup_reps=10000):
         ws_str = "_ws" if ws else ""
         # disable on-host warpspec on Hopper
         if HAS_HOST_TENSOR_DESC and not (is_hopper() and ws):
+            if HAS_TMA_CLC:
+                bench_fn(f"clc_tma{ws_str}", reps, warmup_reps, lambda a, b: matmul_tma_clc(a, b, ws), a, b)
             bench_fn(f"tma_persistent{ws_str}", reps, warmup_reps, lambda a, b: matmul_tma_persistent(a, b, ws), a, b)
             bench_fn(f"tma{ws_str}", reps, warmup_reps, lambda a, b: matmul_tma(a, b, ws), a, b)
         if HAS_TENSOR_DESC:
@@ -682,11 +792,11 @@ def validate(M, N, K, dtype):
 
     naive_result = matmul(a, b.T).to(torch.float16)
     run_test(naive_result, torch_matmul, a, b, "Torch", enabled=dtype == torch.float16)
-    run_test(naive_result, cublas_matmul, a, b, "cuBLAS", enabled=cublas is not None)
+    run_test(naive_result, device_blas_matmul, a, b, device_blas_name(), enabled=device_blas is not None)
     run_test(naive_result, matmul_persistent, a, b.T, "Persistent")
-
     kernels = [
         (matmul_tma, "TMA", HAS_HOST_TENSOR_DESC),
+        (matmul_tma_clc, "CLC TMA", HAS_TMA_CLC),
         (matmul_tma_persistent, "TMA Persistent", HAS_HOST_TENSOR_DESC),
         (matmul_descriptor_persistent, "Tensor Descriptor Persistent", HAS_TENSOR_DESC),
     ]
@@ -722,7 +832,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.prec == 'fp8' and (not hasattr(torch, "float8_e4m3fn") or not is_cuda()):
-        print("This example requires CUDA with fp8 support.")
+        print("This example requires CUDA/HIP with fp8 support.")
     else:
         dtype = torch.float8_e4m3fn if args.prec == 'fp8' else torch.float16
 

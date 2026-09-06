@@ -6,11 +6,21 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import triton
-from triton_kernels.distributed import convert_dp_to_ep, convert_ep_to_dp, make_expt_dict_uniform, make_expt_dict_random, make_expt_assignment, symm_mem_pool
+from triton.testing import cuda_graph_without_gc
+from triton_kernels.distributed import (
+    _convert_dp_to_ep,
+    _convert_ep_to_dp,
+    convert_dp_to_ep,
+    convert_ep_to_dp,
+    make_expt_dict_uniform,
+    make_expt_dict_random,
+    make_expt_assignment,
+    SymmetricMemoryPool,
+)
+from triton_kernels.distributed_details.mesh import Mesh
 from triton_kernels.reduce import reduce
 from triton_kernels.topk import topk
-from triton_kernels.matmul_ogs import matmul_ogs, RoutingData, GatherIndx, ScatterIndx
-from triton_kernels.target_info import is_hip
+from triton_kernels.matmul import matmul
 from triton_kernels.tensor import make_ragged_tensor_metadata, remap_ragged_tensor_metadata
 import pytest
 
@@ -66,7 +76,7 @@ def _distributed_worker(rank, fn, world_size, kwargs):
 
 
 @pytest.fixture
-def distributed_launcher(request):
+def distributed_launcher(request, monkeypatch):
     n_gpus = getattr(request, "param", None)
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for distributed GPU test")
@@ -75,9 +85,11 @@ def distributed_launcher(request):
 
     master_port = _get_free_tcp_port()
 
-    os.environ["WORLD_SIZE"] = str(n_gpus)
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(master_port))
+    monkeypatch.setenv("WORLD_SIZE", str(n_gpus))
+    if "MASTER_ADDR" not in os.environ:
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    if "MASTER_PORT" not in os.environ:
+        monkeypatch.setenv("MASTER_PORT", str(master_port))
 
     def launch(fn, **kwargs):
         mp.spawn(
@@ -89,6 +101,76 @@ def distributed_launcher(request):
 
     launch.world_size = n_gpus
     return launch
+
+
+# ------------------------------------------------------------
+# conversion kernels
+# ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kernel", [_convert_dp_to_ep, _convert_ep_to_dp], ids=["dp_to_ep", "ep_to_dp"])
+@pytest.mark.parametrize("large_operand", ["src", "dst"])
+def test_convert_large_strides(kernel, large_operand, device):
+    n_rows = 5
+    # The final row is 2**32 elements from the base, which overflows an int32 offset calculation.
+    overflow_stride = 1 << 30
+    values = torch.arange(1, n_rows + 1, dtype=torch.uint8, device=device).reshape(n_rows, 1)
+    small = torch.empty_strided(values.shape, (2, 1), dtype=values.dtype, device=device)
+    small.copy_(values)
+
+    storage = torch.empty((n_rows - 1) * overflow_stride + 1, dtype=torch.uint8, device=device)
+    large = torch.as_strided(storage, values.shape, (overflow_stride, 1))
+    large.zero_()
+    if large_operand == "src":
+        large.copy_(values)
+        src = large
+        dst = torch.empty_strided(values.shape, (2, 1), dtype=values.dtype, device=device)
+    else:
+        src, dst = small, large
+
+    expt_filter = torch.ones((1, 1), dtype=torch.int32, device=device)
+    expt_indx = torch.zeros((n_rows, 1), dtype=torch.int32, device=device)
+    row_indx = torch.arange(n_rows, dtype=torch.int32, device=device).reshape(n_rows, 1)
+
+    if kernel is _convert_dp_to_ep:
+        kernel[(n_rows, )](
+            (dst, ),
+            dst.stride(0),
+            src,
+            src.stride(0),
+            src.shape[1],
+            expt_filter,
+            expt_filter.stride(0),
+            expt_indx,
+            expt_indx.stride(0),
+            row_indx,
+            row_indx.stride(0),
+            n_rows,
+            SRC_RANK=0,
+            N_EXPT_ACT=1,
+            N_RANKS=1,
+            BLOCK=1,
+            num_warps=1,
+        )
+    else:
+        kernel[(n_rows, )](
+            (dst, ),
+            dst.stride(0),
+            src,
+            src.stride(0),
+            src.shape[1],
+            expt_filter,
+            expt_filter.stride(0),
+            expt_indx,
+            row_indx,
+            n_rows,
+            BLOCK=1,
+            SRC_RANK=0,
+            N_RANKS=1,
+            num_warps=1,
+        )
+
+    assert torch.equal(dst, values)
 
 
 # ------------------------------------------------------------
@@ -123,26 +205,28 @@ def routing(logits, n_expts_act, all_gather=False, y_indx=None):
     dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
     combine_indx = sparse_logits.mask_metadata.col_sorted_indx
     ragged_batch_metadata = make_ragged_tensor_metadata(sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0])
-    gate_scal = sparse_logits.vals.flatten()[combine_indx]
-    routing_data = RoutingData(gate_scal, ragged_batch_metadata.slice_sizes, logits.shape[-1], n_expts_act,
-                               ragged_batch_metadata)
-    gather_idx = GatherIndx(combine_indx, dispatch_indx)
-    scatter_idx = ScatterIndx(dispatch_indx, combine_indx)
-    return routing_data, gather_idx, scatter_idx, sparse_logits.indx
+    gather_idx = torch.div(combine_indx, n_expts_act, rounding_mode="trunc")
+    scatter_idx = combine_indx
+    return ragged_batch_metadata, gather_idx, scatter_idx, sparse_logits.indx
 
 
 def mixture_of_expt_nosharded(x_global, l_global, w_global, b_global, n_expts_act, y_indx=None):
     rdata, combine_indx, dispatch_indx, _ = routing(l_global, n_expts_act, y_indx=y_indx)
-    y_global = matmul_ogs(x_global, w_global, b_global, rdata, gather_indx=combine_indx, scatter_indx=dispatch_indx)
+    y_global = matmul(x_global, w_global, b_global, rdata, gather_indx=combine_indx, scatter_indx=dispatch_indx)
+    y_mask = (dispatch_indx != -1).view(y_global.shape[-2] // n_expts_act, n_expts_act, 1)
+    y_global = y_global.view(y_global.shape[-2] // n_expts_act, n_expts_act, -1)
+    y_mask = y_mask.expand_as(y_global)
+    y_global, _ = reduce(y_global, dim=1, mask=y_mask)
     return y_global
 
 
 def mixture_of_expt_epsharded(x_dp_local, l_dp_local, w_ep_local, b_ep_local, expt_assignment, n_expts_act,
-                              y_indx=None):
+                              symm_mem_pool, y_indx=None):
     rank = dist.get_rank()
     expt_map = expt_assignment.expt_map[rank, :]
     # active global logits (sparse)
-    l_global_active = topk(l_dp_local, n_expts_act, apply_softmax=True, all_gather=True, y_indx=y_indx)
+    l_global_active = topk(l_dp_local, n_expts_act, apply_softmax=True, all_gather=True, y_indx=y_indx,
+                           symm_mem_pool=symm_mem_pool)
     # expert histogram, dispatch/combine indx
     active_indx = l_global_active.indx
     expt_sizes = l_global_active.mask_metadata.col_sum
@@ -151,14 +235,12 @@ def mixture_of_expt_epsharded(x_dp_local, l_dp_local, w_ep_local, b_ep_local, ex
     # ragged tensor metadata
     x_global_metadata = make_ragged_tensor_metadata(expt_sizes, dispatch_indx.shape[0])
     # convert x from dp-local to expert-sorted, ep-local
-    y_ep_local = convert_dp_to_ep(x_dp_local, expt_assignment, active_indx, dispatch_indx)
+    y_ep_local = convert_dp_to_ep(x_dp_local, expt_assignment, active_indx, dispatch_indx, symm_mem_pool)
     y_ep_local_metadata = remap_ragged_tensor_metadata(x_global_metadata, expt_map)
     # matrix multiply
-    # TODO: clean-up API. `RoutingData` should not exist; we should be passing `y_ep_local_metadata`.
-    rdata_ep_local = RoutingData(None, expt_sizes, w_ep_local.shape[0], n_expts_act, y_ep_local_metadata)
-    y_ep_local = matmul_ogs(y_ep_local, w_ep_local, b_ep_local, rdata_ep_local)
+    y_ep_local = matmul(y_ep_local, w_ep_local, b_ep_local, a_ragged_metadata=y_ep_local_metadata)
     # convert x from expert-sorted, ep-local to token-sorted, dp-local
-    y_dp_local = convert_ep_to_dp(y_ep_local, expt_assignment, active_indx, combine_indx)
+    y_dp_local = convert_ep_to_dp(y_ep_local, expt_assignment, active_indx, combine_indx, symm_mem_pool)
     # weighted average of the output token from experts
     y_dp_local = y_dp_local.view(-1, n_expts_act, y_dp_local.shape[-1])
     z_dp_local, _ = reduce(y_dp_local, dim=1)
@@ -198,7 +280,18 @@ def _run_expert_sharding(rank, world_size, *, n_tokens, d_model, n_expts_tot, n_
         y_indx=y_indx_global,
     )
 
-    def run_mixture():
+    symm_mem_pool = SymmetricMemoryPool(Mesh(dist.group.WORLD))
+    symm_mem_pool.initialize_matmul(
+        n_tokens_global=n_tokens_global,
+        d_input=d_model,
+        d_model=d_model,
+        n_expts_act=n_expts_act,
+        n_expts_tot=n_expts_tot,
+        dtype=torch.bfloat16,
+        device=dev,
+    )
+
+    def run_moe():
         return mixture_of_expt_epsharded(
             x_dp_local,
             l_dp_local,
@@ -207,20 +300,10 @@ def _run_expert_sharding(rank, world_size, *, n_tokens, d_model, n_expts_tot, n_
             expt_assignment,
             n_expts_act,
             y_indx=y_indx_global,
+            symm_mem_pool=symm_mem_pool,
         )
 
-    symm_mem_pool.initialize_matmul_ogs(
-        n_tokens_global=n_tokens_global,
-        d_input=d_model,
-        d_model=d_model,
-        n_expts_act=n_expts_act,
-        n_expts_tot=n_expts_tot,
-        dtype=torch.bfloat16,
-        n_ranks=world_size,
-        group=dist.group.WORLD,
-        device=dev,
-    )
-    y_dp_local_tri = run_mixture()
+    y_dp_local_tri = run_moe()
     y_global_tri = torch.empty_like(y_global_ref)
 
     # Validate warmup run.
@@ -231,8 +314,8 @@ def _run_expert_sharding(rank, world_size, *, n_tokens, d_model, n_expts_tot, n_
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        with torch.cuda.graph(g):
-            y_dp_local_tri_graph = run_mixture()
+        with cuda_graph_without_gc(g):
+            y_dp_local_tri_graph = run_moe()
 
     g.replay()
     dist.all_gather_into_tensor(y_global_tri, y_dp_local_tri_graph)
@@ -244,8 +327,6 @@ def _run_expert_sharding(rank, world_size, *, n_tokens, d_model, n_expts_tot, n_
 @pytest.mark.parametrize("d_model, n_expts_tot, n_expts_act", [(16, 4, 4), (5760, 128, 4)])
 @pytest.mark.parametrize("affinity_mode", ["uniform", "random"])
 def test_expert_sharding(distributed_launcher, n_tokens, d_model, n_expts_tot, n_expts_act, affinity_mode):
-    if is_hip():
-        pytest.skip("Distributed test is not supported on AMD GPU")
     if n_tokens < distributed_launcher.world_size:
         raise ValueError("n_tokens must be >= number of gpus")
     if n_tokens % distributed_launcher.world_size != 0:

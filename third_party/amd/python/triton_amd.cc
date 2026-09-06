@@ -1,13 +1,14 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/include/hipblas_instance.h"
 #include "amd/include/hipblas_types.h"
+#include "lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "lld/Common/Driver.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "passes.h"
+#include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -29,48 +30,61 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/TargetParser/TargetParser.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
+#include "llvm/TargetParser/Triple.h"
 #include <array>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 #include <optional>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
 #include <sstream>
 #include <stdexcept>
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace {
-const char *const amdTargetTriple = "amdgcn-amd-amdhsa";
+llvm::Triple getAMDTargetTriple(const std::string &arch) {
+  llvm::AMDGPU::GPUKind gpuKind = llvm::AMDGPU::parseArchAMDGCN(arch);
+  llvm::Triple::SubArchType subArch = llvm::AMDGPU::getSubArch(gpuKind);
+  if (subArch == llvm::Triple::NoSubArch)
+    throw std::invalid_argument("invalid AMD GPU architecture: " + arch);
 
-void init_triton_amd_passes_ttgpuir(py::module &&m) {
+  return llvm::Triple(llvm::Triple::amdgpu, subArch, llvm::Triple::AMD,
+                      llvm::Triple::AMDHSA);
+}
+
+void init_triton_amd_passes_ttgpuir(py::module_ &m) {
   using namespace mlir::triton;
   m.def("add_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
         });
-  m.def("add_builtin_func_to_llvmir", [](mlir::PassManager &pm, bool ftz) {
-    pm.addPass(createConvertBuiltinFuncToLLVMPass(ftz));
-  });
-  m.def("insert_instruction_sched_hints", [](mlir::PassManager &pm,
-                                             const std::string &variant) {
-    pm.addPass(createTritonAMDGPUInsertInstructionSchedHintsPass(variant));
-  });
-  m.def("lower_instruction_sched_hints",
-        [](mlir::PassManager &pm, const std::string &arch, int32_t numStages) {
-          pm.addPass(createTritonAMDGPULowerInstructionSchedHintsPass(
-              arch, numStages));
+  m.def("add_builtin_func_to_llvmir",
+        [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
+          pm.addPass(createConvertBuiltinFuncToLLVMPass(arch, ftz));
         });
-  ADD_PASS_WRAPPER_2("add_optimize_lds_usage",
-                     mlir::triton::AMD::createOptimizeLDSUsagePass,
-                     const std::string &, int32_t);
-  ADD_PASS_WRAPPER_0("add_allocate_shared_memory",
-                     mlir::triton::createAllocateAMDGPUSharedMemory);
+  m.def("add_prepare_consan_captures", [](mlir::PassManager &pm) {
+    mlir::triton::instrument::TritonInstrumentPrepareConSanCapturesOptions
+        options;
+    options.target = "amd";
+    pm.addPass(
+        mlir::triton::instrument::createTritonInstrumentPrepareConSanCaptures(
+            options));
+  });
+  ADD_PASS_OPTION_WRAPPER_1("add_allocate_shared_memory",
+                            mlir::triton::createAllocateAMDGPUSharedMemoryPass,
+                            const std::string &);
   ADD_PASS_OPTION_WRAPPER_3("add_accelerate_matmul",
                             mlir::createTritonAMDGPUAccelerateMatmul,
                             const std::string, int, int);
   ADD_PASS_WRAPPER_0("add_optimize_epilogue",
                      mlir::createTritonAMDGPUOptimizeEpilogue);
+  ADD_PASS_WRAPPER_0("add_warp_pipeline", mlir::createTritonAMDGPUWarpPipeline);
+  ADD_PASS_OPTION_WRAPPER_1("add_warp_pipeline_conversion",
+                            mlir::triton::AMD::createConvertWarpPipelinePass,
+                            const std::string &);
   ADD_PASS_OPTION_WRAPPER_1(
       "add_optimize_dot_operands",
       mlir::triton::amdgpu::createTritonAMDGPUOptimizeDotOperands,
@@ -79,16 +93,30 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
     pm.addNestedPass<mlir::triton::FuncOp>(
         mlir::createTritonAMDGPUHoistLayoutConversions());
   });
+  m.def("add_sink_layout_conversions", [](mlir::PassManager &pm) {
+    pm.addNestedPass<mlir::triton::FuncOp>(
+        mlir::createTritonAMDGPUSinkLayoutConversions());
+  });
+  m.def("add_prepare_if_combining", [](mlir::PassManager &pm) {
+    pm.addNestedPass<mlir::triton::FuncOp>(
+        mlir::createTritonAMDGPUPrepareIfCombining());
+  });
   m.def("add_canonicalize_pointers", [](mlir::PassManager &pm) {
     pm.addNestedPass<mlir::triton::FuncOp>(
         mlir::createTritonAMDGPUCanonicalizePointers());
   });
+  m.def("add_move_up_prologue_loads", [](mlir::PassManager &pm) {
+    pm.addNestedPass<mlir::triton::FuncOp>(
+        mlir::createTritonAMDGPUMoveUpPrologueLoads());
+  });
   ADD_PASS_OPTION_WRAPPER_3("add_convert_to_buffer_ops",
                             mlir::createTritonAMDGPUConvertToBufferOps,
                             const std::string &, bool, bool);
-  ADD_PASS_WRAPPER_0("add_reorder_instructions",
-                     mlir::createTritonAMDGPUReorderInstructions);
+  ADD_FUNC_PASS_WRAPPER_0("add_optimize_buffer_op_ptr",
+                          mlir::createTritonAMDGPUOptimizeBufferOpPtr);
   ADD_PASS_WRAPPER_0("add_fold_true_cmpi", mlir::createTritonAMDFoldTrueCmpI);
+  ADD_PASS_WRAPPER_0("add_fp_sanitizer", mlir::createTritonAMDGPUFpSanitizer);
+
   ADD_PASS_OPTION_WRAPPER_1("add_block_pingpong",
                             mlir::createTritonAMDGPUBlockPingpong, int32_t);
   ADD_PASS_OPTION_WRAPPER_1("add_schedule_loops",
@@ -101,10 +129,19 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
   ADD_PASS_OPTION_WRAPPER_1("add_update_async_wait_count",
                             mlir::createTritonAMDGPUUpdateAsyncWaitCount,
                             std::string);
+  ADD_PASS_WRAPPER_0("add_optimize_descriptor_encoding",
+                     mlir::createTritonAMDGPUOptimizeDescriptorEncoding);
+  ADD_PASS_WRAPPER_0("add_convert_to_tensor_ops",
+                     mlir::createTritonAMDGPUConvertToTensorOps);
+  mlir::registerConSanAMDHooks();
   m.def("add_in_thread_transpose", [](mlir::PassManager &pm) {
     pm.addNestedPass<mlir::triton::FuncOp>(
         mlir::createTritonAMDGPUInThreadTranspose());
   });
+  ADD_PASS_WRAPPER_1(
+      "add_warp_specialize_to_llvm",
+      mlir::triton::AMD::createTritonAMDGPUConvertWarpSpecializeToLLVMPass,
+      const std::string &);
 }
 
 void addControlConstant(llvm::Module *module, const char *name,
@@ -225,18 +262,18 @@ struct HipBlasInit {
 static HipBlasInit initialize_hipblas_op(py::object &A, py::object &B,
                                          py::object &out,
                                          std::optional<py::object> accumOpt) {
-  auto A_shape = A.attr("shape").cast<std::vector<int>>();
-  auto B_shape = B.attr("shape").cast<std::vector<int>>();
-  auto OUT_shape = out.attr("shape").cast<std::vector<int>>();
+  auto A_shape = py::cast<std::vector<int>>(A.attr("shape"));
+  auto B_shape = py::cast<std::vector<int>>(B.attr("shape"));
+  auto OUT_shape = py::cast<std::vector<int>>(out.attr("shape"));
 
-  auto A_dtype = A.attr("dtype").attr("__str__")().cast<std::string>();
-  auto B_dtype = B.attr("dtype").attr("__str__")().cast<std::string>();
-  auto OUT_dtype = out.attr("dtype").attr("__str__")().cast<std::string>();
+  auto A_dtype = py::cast<std::string>(A.attr("dtype").attr("__str__")());
+  auto B_dtype = py::cast<std::string>(B.attr("dtype").attr("__str__")());
+  auto OUT_dtype = py::cast<std::string>(out.attr("dtype").attr("__str__")());
 
   if (accumOpt.has_value()) {
     auto C = accumOpt.value();
-    auto C_shape = C.attr("shape").cast<std::vector<int>>();
-    auto C_dtype = C.attr("dtype").attr("__str__")().cast<std::string>();
+    auto C_shape = py::cast<std::vector<int>>(C.attr("shape"));
+    auto C_dtype = py::cast<std::string>(C.attr("dtype").attr("__str__")());
 
     checkMatmulConstraints(A_dtype, B_dtype, OUT_dtype, A_shape, B_shape,
                            OUT_shape);
@@ -304,7 +341,7 @@ static std::optional<std::string> lldInvoke(const char *inPath,
   std::array args{"ld.lld", "--threads=1", "-shared", inPath, "-o", outPath};
   std::string errString;
   llvm::raw_string_ostream errStream(errString);
-  auto lldRes = lld::lldMain(args, llvm::outs(), llvm::errs(),
+  auto lldRes = lld::lldMain(args, llvm::outs(), errStream,
                              {{lld::Gnu, &lld::elf::link}});
   bool noErrors = (!lldRes.retCode && lldRes.canRunAgain);
   if (!noErrors) {
@@ -314,15 +351,18 @@ static std::optional<std::string> lldInvoke(const char *inPath,
   return {};
 }
 
-void init_triton_amd(py::module &&m) {
+void init_triton_amd(py::module_ &m) {
   m.doc() = "Python bindings to the AMD Triton backend";
 
   auto passes = m.def_submodule("passes");
-  init_triton_amd_passes_ttgpuir(passes.def_submodule("ttgpuir"));
+  auto ttgpuir_m = passes.def_submodule("ttgpuir");
+  init_triton_amd_passes_ttgpuir(ttgpuir_m);
 
-  m.attr("TARGET_TRIPLE") = amdTargetTriple;
   m.attr("CALLING_CONV_AMDGPU_KERNEL") =
       (unsigned)llvm::CallingConv::AMDGPU_KERNEL;
+
+  m.def("get_target_triple",
+        [](const std::string &arch) { return getAMDTargetTriple(arch).str(); });
 
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
@@ -333,9 +373,10 @@ void init_triton_amd(py::module &&m) {
     context.loadAllAvailableDialects();
   });
 
-  m.def("attach_target_triple", [](llvm::Module *module) {
-    module->setTargetTriple(llvm::Triple(amdTargetTriple));
-  });
+  m.def("attach_target_triple",
+        [](llvm::Module *module, const std::string &arch) {
+          module->setTargetTriple(getAMDTargetTriple(arch));
+        });
 
   // Set target architecture ISA version
   m.def("set_isa_version", [](llvm::Module *module, const std::string &arch) {
@@ -400,72 +441,68 @@ void init_triton_amd(py::module &&m) {
     }
   });
 
-  m.def(
-      "assemble_amdgcn",
-      [](const std::string &assembly, const std::string &arch,
-         const std::string &features) {
-        std::string error;
+  m.def("assemble_amdgcn", [](const std::string &assembly,
+                              const std::string &arch,
+                              const std::string &features) {
+    std::string error;
 
-        llvm::Triple triple(amdTargetTriple);
-        const llvm::Target *target =
-            llvm::TargetRegistry::lookupTarget(triple, error);
-        if (!target)
-          throw std::runtime_error("target lookup error: " + error);
+    llvm::Triple triple = getAMDTargetTriple(arch);
+    const llvm::Target *target =
+        llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target)
+      throw std::runtime_error("target lookup error: " + error);
 
-        llvm::SourceMgr srcMgr;
-        srcMgr.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBuffer(assembly),
-                                  llvm::SMLoc());
+    llvm::SourceMgr srcMgr;
+    srcMgr.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBuffer(assembly),
+                              llvm::SMLoc());
 
-        const llvm::MCTargetOptions mcOptions;
-        std::unique_ptr<llvm::MCRegisterInfo> mri(
-            target->createMCRegInfo(triple));
-        std::unique_ptr<llvm::MCAsmInfo> mai(
-            target->createMCAsmInfo(*mri, triple, mcOptions));
-        std::unique_ptr<llvm::MCSubtargetInfo> sti(
-            target->createMCSubtargetInfo(triple, arch, features));
+    const llvm::MCTargetOptions mcOptions;
+    std::unique_ptr<llvm::MCRegisterInfo> mri(target->createMCRegInfo(triple));
+    std::unique_ptr<llvm::MCAsmInfo> mai(
+        target->createMCAsmInfo(*mri, triple, mcOptions));
+    std::unique_ptr<llvm::MCSubtargetInfo> sti(
+        target->createMCSubtargetInfo(triple, arch, features));
 
-        llvm::MCContext ctx(triple, mai.get(), mri.get(), sti.get(), &srcMgr,
-                            &mcOptions);
-        std::unique_ptr<llvm::MCObjectFileInfo> mofi(
-            target->createMCObjectFileInfo(ctx, /*PIC=*/false,
-                                           /*LargeCodeModel=*/false));
-        ctx.setObjectFileInfo(mofi.get());
+    llvm::MCContext ctx(triple, *mai, *mri, *sti, &srcMgr);
+    std::unique_ptr<llvm::MCObjectFileInfo> mofi(
+        target->createMCObjectFileInfo(ctx, /*PIC=*/false,
+                                       /*LargeCodeModel=*/false));
+    ctx.setObjectFileInfo(mofi.get());
 
-        llvm::SmallString<128> cwd;
-        if (!llvm::sys::fs::current_path(cwd))
-          ctx.setCompilationDir(cwd);
+    llvm::SmallString<128> cwd;
+    if (!llvm::sys::fs::current_path(cwd))
+      ctx.setCompilationDir(cwd);
 
-        llvm::SmallVector<char, 0> result;
-        llvm::raw_svector_ostream svos(result);
+    llvm::SmallVector<char, 0> result;
+    llvm::raw_svector_ostream svos(result);
 
-        std::unique_ptr<llvm::MCStreamer> mcStreamer;
-        std::unique_ptr<llvm::MCInstrInfo> mcii(target->createMCInstrInfo());
+    std::unique_ptr<llvm::MCStreamer> mcStreamer;
+    std::unique_ptr<llvm::MCInstrInfo> mcii(target->createMCInstrInfo());
 
-        std::unique_ptr<llvm::MCCodeEmitter> ce(
-            target->createMCCodeEmitter(*mcii, ctx));
-        std::unique_ptr<llvm::MCAsmBackend> mab(
-            target->createMCAsmBackend(*sti, *mri, mcOptions));
-        std::unique_ptr<llvm::MCObjectWriter> ow(mab->createObjectWriter(svos));
-        mcStreamer.reset(target->createMCObjectStreamer(
-            triple, ctx, std::move(mab), std::move(ow), std::move(ce), *sti));
+    std::unique_ptr<llvm::MCCodeEmitter> ce(
+        target->createMCCodeEmitter(*mcii, ctx));
+    std::unique_ptr<llvm::MCAsmBackend> mab(
+        target->createMCAsmBackend(*sti, *mri, mcOptions));
+    std::unique_ptr<llvm::MCObjectWriter> ow(mab->createObjectWriter(svos));
+    mcStreamer.reset(target->createMCObjectStreamer(
+        triple, ctx, std::move(mab), std::move(ow), std::move(ce), *sti));
 
-        std::unique_ptr<llvm::MCAsmParser> parser(
-            createMCAsmParser(srcMgr, ctx, *mcStreamer, *mai));
-        std::unique_ptr<llvm::MCTargetAsmParser> tap(
-            target->createMCAsmParser(*sti, *parser, *mcii, mcOptions));
-        if (!tap)
-          throw std::runtime_error("assembler initializtion error");
+    std::unique_ptr<llvm::MCAsmParser> parser(
+        createMCAsmParser(srcMgr, ctx, *mcStreamer, *mai));
+    std::unique_ptr<llvm::MCTargetAsmParser> tap(
+        target->createMCAsmParser(*sti, *parser, *mcii));
+    if (!tap)
+      throw std::runtime_error("assembler initializtion error");
 
-        parser->setTargetParser(*tap);
-        parser->Run(/*NoInitialTextSection=*/false);
+    parser->setTargetParser(*tap);
+    parser->Run(/*NoInitialTextSection=*/false);
 
-        return py::bytes(std::string(result.begin(), result.end()));
-      },
-      py::return_value_policy::take_ownership);
+    return py::bytes(result.data(), result.size());
+  });
 
   m.def("has_architected_sgprs", [](const std::string &arch) {
     std::string error;
-    llvm::Triple triple(amdTargetTriple);
+    llvm::Triple triple = getAMDTargetTriple(arch);
     const llvm::Target *target =
         llvm::TargetRegistry::lookupTarget(triple, error);
     if (!target)
@@ -473,6 +510,14 @@ void init_triton_amd(py::module &&m) {
     std::unique_ptr<llvm::MCSubtargetInfo> sti(
         target->createMCSubtargetInfo(triple, arch, ""));
     return sti->checkFeatures("+architected-sgprs");
+  });
+
+  m.def("supports_multi_cta_launch", [](const std::string &arch) {
+    return mlir::triton::AMD::TargetInfo(arch).supportsMultiCTALaunch();
+  });
+
+  m.def("supports_tdm", [](const std::string &arch) {
+    return mlir::triton::AMD::TargetInfo(arch).supportsTDM();
   });
 
   m.def("need_extern_lib", [](llvm::Module *module, const std::string &lib) {
@@ -521,28 +566,54 @@ void init_triton_amd(py::module &&m) {
 
   auto hipBlas = m.def_submodule("hipblas");
   py::class_<HipblasLtInstance>(hipBlas, "HipblasLt")
-      .def(py::init<>([&](py::object &workspace) {
-        auto wrk_ptr = workspace.attr("data_ptr")().cast<uint64_t>();
-        auto wrk_size = workspace.attr("numel")().cast<size_t>() *
-                        workspace.attr("element_size")().cast<size_t>();
-        return new HipblasLtInstance(wrk_ptr, wrk_size);
+      .def(py::new_([](py::object workspace) {
+        // For ROCm installed via TheRock wheels, libhipblaslt resides within
+        // the Python wheel package rather than a standard loader path such as
+        // /opt/rocm/lib. Resolve its absolute path through rocm_sdk instead of
+        // merely preloading it: dlopen by bare soname cannot reliably reuse a
+        // preloaded library. Non-TheRock ROCm installations retain the
+        // libhipblaslt.so system-loader fallback.
+        std::string hipblasLtPath = "libhipblaslt.so";
+        try {
+          auto libraries = py::module_::import_("rocm_sdk")
+                               .attr("find_libraries")("hipblaslt");
+          auto path = libraries.attr("__getitem__")(0);
+          auto pathString = path.attr("__str__")();
+          const char *pathChars = PyUnicode_AsUTF8(pathString.ptr());
+          if (pathChars == nullptr)
+            throw py::python_error();
+          hipblasLtPath = pathChars;
+        } catch (py::python_error &e) {
+          e.restore();
+          if (PyErr_ExceptionMatches(PyExc_ImportError) ||
+              PyErr_ExceptionMatches(PyExc_FileNotFoundError) ||
+              PyErr_ExceptionMatches(PyExc_IndexError)) {
+            PyErr_Clear();
+          } else {
+            throw py::python_error();
+          }
+        }
+        auto wrk_ptr = py::cast<uint64_t>(workspace.attr("data_ptr")());
+        auto wrk_size = py::cast<size_t>(workspace.attr("numel")()) *
+                        py::cast<size_t>(workspace.attr("element_size")());
+        return new HipblasLtInstance(wrk_ptr, wrk_size, hipblasLtPath);
       }))
       .def("matmul",
            [](HipblasLtInstance &self, py::object &A, py::object &B,
               py::object &C) {
-             auto A_ptr = A.attr("data_ptr")().cast<uint64_t>();
-             auto B_ptr = B.attr("data_ptr")().cast<uint64_t>();
-             auto C_ptr = C.attr("data_ptr")().cast<uint64_t>();
+             auto A_ptr = py::cast<uint64_t>(A.attr("data_ptr")());
+             auto B_ptr = py::cast<uint64_t>(B.attr("data_ptr")());
+             auto C_ptr = py::cast<uint64_t>(C.attr("data_ptr")());
              auto init = initialize_hipblas_op(A, B, C, std::nullopt);
              self.matmul(init.m, init.n, init.k, A_ptr, B_ptr, C_ptr,
                          init.dtype, init.out_dtype);
            })
       .def("gemm", [](HipblasLtInstance &self, py::object &A, py::object &B,
                       py::object &C, py::object &D, float alpha, float beta) {
-        auto A_ptr = A.attr("data_ptr")().cast<uint64_t>();
-        auto B_ptr = B.attr("data_ptr")().cast<uint64_t>();
-        auto C_ptr = C.attr("data_ptr")().cast<uint64_t>();
-        auto D_ptr = D.attr("data_ptr")().cast<uint64_t>();
+        auto A_ptr = py::cast<uint64_t>(A.attr("data_ptr")());
+        auto B_ptr = py::cast<uint64_t>(B.attr("data_ptr")());
+        auto C_ptr = py::cast<uint64_t>(C.attr("data_ptr")());
+        auto D_ptr = py::cast<uint64_t>(D.attr("data_ptr")());
         auto init = initialize_hipblas_op(A, B, D, C);
         self.gemm(init.m, init.n, init.k, A_ptr, B_ptr, C_ptr, D_ptr,
                   init.dtype, init.out_dtype, alpha, beta);

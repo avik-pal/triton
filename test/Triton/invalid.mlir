@@ -1,9 +1,46 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+tt.func @atomic_poll_mismatched_result(%ptr: tensor<32x!tt.ptr<i32>>, %expected: tensor<32xi32>) {
+  // expected-error @+1 {{result type matches expected shape}}
+  %matched = tt.atomic_poll acquire, gpu, %ptr, %expected : tensor<32x!tt.ptr<i32>>, tensor<32xi32> -> i1
+  tt.return
+}
+
+// -----
+
+tt.func @atomic_poll_invalid_width(%ptr: tensor<32x!tt.ptr<i8>>, %expected: tensor<32xi8>) {
+  // expected-error @+1 {{only supports integer elements with width {16, 32, 64}}}
+  %matched = tt.atomic_poll acquire, gpu, %ptr, %expected : tensor<32x!tt.ptr<i8>>, tensor<32xi8> -> tensor<32xi1>
+  tt.return
+}
+
+// -----
+
 tt.func @fn(%v: i32) {
   %b = tt.splat %v : i32 -> tensor<128xi32>
   // expected-error @+1 {{rank of source must be same as rank of result}}
   %c = tt.broadcast %b : tensor<128xi32> -> tensor<128x32xi32>
+  tt.return
+}
+
+// -----
+
+// expected-error @+1 {{pointer types must point to integer or floating-point types}}
+tt.func public @invalid_pointer_pointee(%arg0: !tt.ptr<index>) {
+  tt.return
+}
+
+// -----
+
+// expected-error @+1 {{invalid pointer address space 'bogus'}}
+tt.func public @invalid_pointer_address_space(%arg0: !tt.ptr<f32, "bogus">) {
+  tt.return
+}
+
+// -----
+
+// expected-error @+1 {{expected string}}
+tt.func public @invalid_pointer_integer_address_space(%arg0: !tt.ptr<f32, 1>) {
   tt.return
 }
 
@@ -122,6 +159,18 @@ tt.func public @fn(%v: tensor<4x128xf64>) {
 
 // -----
 
+tt.func public @fn(%v: tensor<4x128xf32>) {
+    // expected-error @+1 {{axis out of bounds}}
+    %a = "tt.reduce" (%v) ({
+    ^bb0(%arg0: f32, %arg1: f32):
+      %add = arith.addf %arg0, %arg1 : f32
+      tt.reduce.return %add : f32
+    }) {axis = 2 : i32}  : (tensor<4x128xf32>) -> tensor<4xf32>
+    tt.return
+}
+
+// -----
+
 tt.func @reduce_different_input_shapes(%arg0: tensor<32x32x64xf32>, %arg1: tensor<16x32x64xf32>) -> (tensor<32x64xf32>, tensor<16x64xf32>) {
     // expected-error @below {{op requires the same shape for all operands}}
     %0:2 = "tt.reduce" (%arg0, %arg1) <{axis = 1 : i32}> ({
@@ -171,7 +220,7 @@ tt.func public @fn(%v1: tensor<4x128xf32>, %v2: tensor<4x128xi64>) {
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
 tt.func public @fn(%arg0: tensor<32xf32, #blocked>) {
     // expected-error @+1 {{op result encoding must be specified}}
@@ -269,8 +318,8 @@ tt.func public @fn(%arg0: tensor<16x32x64xf32>) {
 // -----
 
 // Valid op with blocked encoding.
-#blocked2 = #ttg.blocked<{sizePerThread = [1,2,4], threadsPerWarp = [2,4,4], warpsPerCTA = [2,4,8], order = [0,1,2], CTAsPerCGA = [1,2,4], CTASplitNum = [1,2,4], CTAOrder = [0,1,2]}>
-#blocked3 = #ttg.blocked<{sizePerThread = [2,1,4], threadsPerWarp = [4,2,4], warpsPerCTA = [4,2,8], order = [1,0,2], CTAsPerCGA = [2,1,4], CTASplitNum = [2,1,4], CTAOrder = [1,0,2]}>
+#blocked2 = #ttg.blocked<{sizePerThread = [1,2,4], threadsPerWarp = [2,4,4], warpsPerCTA = [2,4,8], order = [0,1,2], CGALayout = [[0, 1, 0], [0, 0, 1], [0, 0, 2]]}>
+#blocked3 = #ttg.blocked<{sizePerThread = [2,1,4], threadsPerWarp = [4,2,4], warpsPerCTA = [4,2,8], order = [1,0,2], CGALayout = [[1, 0, 0], [0, 0, 1], [0, 0, 2]]}>
 module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 64 : i32, "ttg.threads-per-warp" = 32 : i32} {
 tt.func public @fn(%arg0: tensor<16x32x64xf32, #blocked2>) {
     %b = tt.trans %arg0 {order = array<i32: 1, 0, 2>} : tensor<16x32x64xf32, #blocked2> -> tensor<32x16x64xf32, #blocked3>
@@ -281,10 +330,10 @@ tt.func public @fn(%arg0: tensor<16x32x64xf32, #blocked2>) {
 // -----
 
 // Valid op with shared encoding.
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [3, 2, 1, 0]}>
-#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 2, 0, 3]}>
-#shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32, CTAsPerCGA = [1, 2], CTASplitNum = [2, 4], CTAOrder = [0, 1]}>
-#shared3 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 32, CTAsPerCGA = [2, 1], CTASplitNum = [4, 2], CTAOrder = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [3, 2, 1, 0], CGALayout = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]}>
+#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 2, 0, 3], CGALayout = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]}>
+#shared2 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 32, CGALayout = [[1, 0], [0, 1], [0, 2]]}>
+#shared3 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 32, CGALayout = [[0, 1], [1, 0], [2, 0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 64 : i32, "ttg.threads-per-warp" = 32 : i32} {
 tt.func public @fn(%arg0: !ttg.memdesc<2x4x8x16xf32, #shared, #smem>, %arg1: !ttg.memdesc<16x32xf32, #shared2, #smem>) {
@@ -297,8 +346,8 @@ tt.func public @fn(%arg0: !ttg.memdesc<2x4x8x16xf32, #shared, #smem>, %arg1: !tt
 // -----
 
 // Invalid blocked encoding.
-#blocked  = #ttg.blocked<{sizePerThread = [1,2,4], threadsPerWarp = [2,4,4], warpsPerCTA = [2,4,8], order = [0,1,2], CTAsPerCGA = [1,2,4], CTASplitNum = [1,2,4], CTAOrder = [0,1,2]}>
-#blocked1 = #ttg.blocked<{sizePerThread = [1,2,4], threadsPerWarp = [4,2,4], warpsPerCTA = [4,2,8], order = [1,0,2], CTAsPerCGA = [2,1,4], CTASplitNum = [2,1,4], CTAOrder = [1,0,2]}>
+#blocked  = #ttg.blocked<{sizePerThread = [1,2,4], threadsPerWarp = [2,4,4], warpsPerCTA = [2,4,8], order = [0,1,2], CGALayout = [[0, 1, 0], [0, 0, 1], [0, 0, 2]]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1,2,4], threadsPerWarp = [4,2,4], warpsPerCTA = [4,2,8], order = [1,0,2], CGALayout = [[1, 0, 0], [0, 0, 1], [0, 0, 2]]}>
 module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 64 : i32, "ttg.threads-per-warp" = 32 : i32} {
 tt.func public @fn(%arg0: tensor<16x32x64xf32, #blocked>) {
     // expected-error @+1 {{type}}
@@ -355,7 +404,7 @@ tt.func public @fn(%arg0: tensor<16x32xf32>) {
 // Invalid tensor with shared encoding.
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1, 2]}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [2, 0, 1]}>
-module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 8 : i32, "ttg.num-warps" = 64 : i32, "ttg.threads-per-warp" = 32 : i32} {
+module attributes {"ttg.target" = "cuda:80", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 64 : i32, "ttg.threads-per-warp" = 32 : i32} {
 tt.func public @fn(%arg0: tensor<16x32x64xf32, #shared>) {
     // expected-error @+1 {{Non-distributed layout is not allowed in tensor type.}}
     %a = tt.trans %arg0 {order = array<i32: 1, 0, 2>} : tensor<16x32x64xf32, #shared> -> tensor<32x16x64xf32, #shared1>
@@ -416,84 +465,84 @@ tt.func @gather_op(%arg0: tensor<128x16xf32>, %arg1: tensor<512x4xi32>) {
 
 // -----
 
-tt.func @invalid_desc_load(%arg0: !tt.tensordesc<tensor<16x16xf32>>) {
+tt.func @invalid_desc_load(%arg0: !tt.tensordesc<16x16xf32>) {
   %c = arith.constant 0 : i32
-  // expected-error @below {{ranked reduce load only allowed for unit dimension leading dim}}
-  tt.descriptor_load %arg0[%c, %c] : !tt.tensordesc<tensor<16x16xf32>> -> tensor<16xf32>
+  // expected-error @below {{descriptor block and tensor must have the same number of elements}}
+  tt.descriptor_load %arg0[%c, %c] : !tt.tensordesc<16x16xf32> -> tensor<16xf32>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_desc_load(%arg0: !tt.tensordesc<tensor<16x16xf32>>) {
+tt.func @invalid_desc_load(%arg0: !tt.tensordesc<16x16xf32>) {
   %c = arith.constant 0 : i32
-  // expected-error @below {{tensor descriptor block and tensor types must match}}
-  tt.descriptor_load %arg0[%c, %c] : !tt.tensordesc<tensor<16x16xf32>> -> tensor<16x16xf16>
+  // expected-error @below {{descriptor block and tensor element types must match}}
+  tt.descriptor_load %arg0[%c, %c] : !tt.tensordesc<16x16xf32> -> tensor<16x16xf16>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_desc_store(%arg0: !tt.tensordesc<tensor<16x16xf32>>, %arg1: tensor<32x16xf32>) {
+tt.func @invalid_desc_store(%arg0: !tt.tensordesc<16x16xf32>, %arg1: tensor<32x16xf32>) {
   %c = arith.constant 0 : i32
-  // expected-error @below {{tensor descriptor block and tensor types must match}}
-  tt.descriptor_store %arg0[%c, %c], %arg1 : !tt.tensordesc<tensor<16x16xf32>>, tensor<32x16xf32>
+  // expected-error @below {{descriptor block and tensor must have the same number of elements}}
+  tt.descriptor_store %arg0[%c, %c], %arg1 : !tt.tensordesc<16x16xf32>, tensor<32x16xf32>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<tensor<128xbf16>>, %arg1: tensor<32xi32>, %arg2: i32) {
+tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<128xbf16>, %arg1: tensor<32xi32>, %arg2: i32) {
   // expected-error @below {{block must be a 2D tensor}}
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<tensor<128xbf16>>, tensor<32xi32>, i32) -> tensor<32xbf16>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<128xbf16>, tensor<32xi32>, i32) -> tensor<32xbf16>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<tensor<2x128xbf16>>, %arg1: tensor<32xi32>, %arg2: i32) {
+tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<2x128xbf16>, %arg1: tensor<32xi32>, %arg2: i32) {
   // expected-error @below {{block must have exactly 1 row}}
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<tensor<2x128xbf16>>, tensor<32xi32>, i32) -> tensor<32x128xbf16>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<2x128xbf16>, tensor<32xi32>, i32) -> tensor<32x128xbf16>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<tensor<1x128xbf16>>, %arg1: tensor<1x32xi32>, %arg2: i32) {
+tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<1x128xbf16>, %arg1: tensor<1x32xi32>, %arg2: i32) {
   // expected-error @below {{x offsets must be a 1D tensor}}
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<tensor<1x128xbf16>>, tensor<1x32xi32>, i32) -> tensor<32x128xbf16>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<1x128xbf16>, tensor<1x32xi32>, i32) -> tensor<32x128xbf16>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<tensor<1x128xbf16>>, %arg1: tensor<32xi32>, %arg2: i32) {
+tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<1x128xbf16>, %arg1: tensor<32xi32>, %arg2: i32) {
   // expected-error @below {{result must be a 2D tensor}}
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<tensor<1x128xbf16>>, tensor<32xi32>, i32) -> tensor<128xbf16>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<1x128xbf16>, tensor<32xi32>, i32) -> tensor<128xbf16>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<tensor<1x128xbf16>>, %arg1: tensor<32xi32>, %arg2: i32) {
+tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<1x128xbf16>, %arg1: tensor<32xi32>, %arg2: i32) {
   // expected-error @below {{result tensor number of columns must match block (128)}}
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<tensor<1x128xbf16>>, tensor<32xi32>, i32) -> tensor<32x64xbf16>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<1x128xbf16>, tensor<32xi32>, i32) -> tensor<32x64xbf16>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<tensor<1x128xbf16>>, %arg1: tensor<32xi32>, %arg2: i32) {
+tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<1x128xbf16>, %arg1: tensor<32xi32>, %arg2: i32) {
   // expected-error @below {{result tensor must have as many rows as indices (32)}}
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<tensor<1x128xbf16>>, tensor<32xi32>, i32) -> tensor<64x128xbf16>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<1x128xbf16>, tensor<32xi32>, i32) -> tensor<64x128xbf16>
   tt.return
 }
 
 // -----
 
-tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<tensor<1x128xbf16>>, %arg1: tensor<32xi32>, %arg2: i32) {
+tt.func @invalid_tma_gather(%arg0: !tt.tensordesc<1x128xbf16>, %arg1: tensor<32xi32>, %arg2: i32) {
   // expected-error @below {{result tensor element type must match block ('bf16')}}
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<tensor<1x128xbf16>>, tensor<32xi32>, i32) -> tensor<32x128xf32>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<1x128xbf16>, tensor<32xi32>, i32) -> tensor<32x128xf32>
   tt.return
 }
 
@@ -548,7 +597,7 @@ module {
     %a_scale: tensor<128x128xi8>,
     %b_scale: tensor<128x4xi8>) -> tensor<128x128xf32> {
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32>
-    // expected-error @below {{scales K dimension must match the operand K divided by the scale factor}}
+    // expected-error @below {{scale factor must be 16 or 32. Got 1}}
     %result = tt.dot_scaled %a scale %a_scale, %b scale %b_scale, %cst lhs = e4m3 rhs = e4m3 {fastMath = true} : tensor<128x128xf8E4M3FN>, tensor<128x128xi8>  * tensor<128x128xf8E4M3FN>, tensor<128x4xi8>-> tensor<128x128xf32>
     tt.return %result : tensor<128x128xf32>
   }

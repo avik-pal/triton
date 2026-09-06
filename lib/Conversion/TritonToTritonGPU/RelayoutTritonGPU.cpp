@@ -22,10 +22,14 @@ RankedTensorType getTMEMTensorLayout(const TypeConverter *tc,
                                      RankedTensorType type, MemDescType memdesc,
                                      unsigned numWarps) {
   type = cast<RankedTensorType>(tc->convertType(type));
-  auto ctaLayout = getCTALayout(type.getEncoding());
-  auto encoding =
-      ttng::getDefaultLayoutForTmemLdSt(memdesc, numWarps, ctaLayout);
+  auto encoding = ttng::getDefaultLayoutForTmemLdSt(memdesc, numWarps);
   return type.cloneWithEncoding(encoding);
+}
+
+bool isTMEMOperandDynamicallyLegal(Operation *op, RankedTensorType type,
+                                   MemDescType memdesc) {
+  return type.getEncoding() &&
+         ttng::isDistributedLayoutTMemCompatible(op, type, memdesc);
 }
 
 struct TMEMLoadOpPattern : public OpConversionPattern<ttng::TMEMLoadOp> {
@@ -34,14 +38,20 @@ struct TMEMLoadOpPattern : public OpConversionPattern<ttng::TMEMLoadOp> {
   LogicalResult
   matchAndRewrite(ttng::TMEMLoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Type resultType = getTypeConverter()->convertType(op.getType());
     RankedTensorType type = getTMEMTensorLayout(
         typeConverter, op.getType(), op.getSrc().getType(), lookupNumWarps(op));
     rewriter.modifyOpInPlace(op, [&] { op.getResult().setType(type); });
-    Type resultType = getTypeConverter()->convertType(op.getType());
+    if (type == resultType)
+      return success();
+
     rewriter.setInsertionPointAfter(op);
     auto cvt = ConvertLayoutOp::create(rewriter, op.getLoc(), resultType,
                                        op.getResult());
-    rewriter.replaceAllUsesExcept(op.getResult(), cvt, cvt);
+    // Bypass the rewriter to avoid issues with the conversion framework's
+    // tracking of conditional replacements.
+    // See https://github.com/llvm/llvm-project/commit/504b50789602
+    op.getResult().replaceAllUsesExcept(cvt, cvt);
     return success();
   }
 };
@@ -79,6 +89,19 @@ struct TMEMAllocOpPattern : public OpConversionPattern<ttng::TMEMAllocOp> {
   }
 };
 
+struct LocalLoadOpPattern : public OpConversionPattern<LocalLoadOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(LocalLoadOp op, OpAdaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto type =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    rewriter.modifyOpInPlace(op, [&] { op.getResult().setType(type); });
+    return success();
+  }
+};
+
 class RelayoutTritonGPU
     : public triton::impl::RelayoutTritonGPUBase<RelayoutTritonGPU> {
 public:
@@ -101,7 +124,24 @@ public:
           return TritonGPUConversionTarget::isDynamicallyLegal(op,
                                                                typeConverter);
         });
-
+    target.addDynamicallyLegalOp<ttng::TMEMLoadOp>([&](ttng::TMEMLoadOp op) {
+      return TritonGPUConversionTarget::isDynamicallyLegal(op, typeConverter) &&
+             isTMEMOperandDynamicallyLegal(op, op.getType(),
+                                           op.getSrc().getType());
+    });
+    target.addDynamicallyLegalOp<ttng::TMEMStoreOp>([&](ttng::TMEMStoreOp op) {
+      return TritonGPUConversionTarget::isDynamicallyLegal(op, typeConverter) &&
+             isTMEMOperandDynamicallyLegal(op, op.getSrc().getType(),
+                                           op.getDst().getType());
+    });
+    target.addDynamicallyLegalOp<ttng::TMEMAllocOp>([&](ttng::TMEMAllocOp op) {
+      return TritonGPUConversionTarget::isDynamicallyLegal(op, typeConverter) &&
+             (!op.getSrc() || isTMEMOperandDynamicallyLegal(
+                                  op, op.getSrc().getType(), op.getType()));
+    });
+    target.addDynamicallyLegalOp<LocalLoadOp>([&](Operation *op) {
+      return TritonGPUConversionTarget::isDynamicallyLegal(op, typeConverter);
+    });
     // rewrite patterns
     RewritePatternSet patterns(context);
     // add rules
@@ -109,13 +149,17 @@ public:
         // clang-format off
         GatherScatterOpPattern<ttng::AsyncTMAGatherOp>,
         GatherScatterOpPattern<ttng::AsyncTMAScatterOp>,
+        LocalLoadOpPattern,
         TMEMLoadOpPattern,
         TMEMStoreOpPattern,
         TMEMAllocOpPattern
         // clang-format on
         >(typeConverter, context);
 
-    if (failed(applyPartialConversion(mod, target, std::move(patterns))))
+    ConversionConfig config;
+    config.allowPatternRollback = false;
+    if (failed(
+            applyPartialConversion(mod, target, std::move(patterns), config)))
       return signalPassFailure();
   }
 };
